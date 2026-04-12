@@ -1,0 +1,9 @@
+**/__pycache__
+wandb*
+*.pth
+retrieve/data_files/*
+retrieve/webqsp_Mar30-17:51:30/*
+.env
+*/.cache/*
+*/*.pth
+reason/gpt_labeled/*

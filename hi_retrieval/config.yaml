@@ -1,0 +1,31 @@
+# Ollama Configuration (local models)
+ollama:
+  model: "llama3.1"
+  base_url: "http://localhost:11434"
+  embedding_model: "nomic-embed-text"
+  embedding_dim: 768
+
+# Custom OpenAI-compatible provider (FPT AI, Together, Groq, Mistral, etc.)
+custom:
+  model: "gpt-oss-120b"
+  api_key: 'sk-SOQaZ8W9puuOUXdyu09iIw'                          
+  base_url: "https://mkp-api.fptcloud.com/v1"
+  embedding_model: "NeuML/pubmedbert-base-embeddings"
+  embedding_dim: 1536
+
+# Model Parameters
+model_params:
+  openai_embedding_dim: 1536
+  glm_embedding_dim: 2048
+  max_token_size: 8192
+
+# HiRAG Configuration
+hirag:
+  working_dir: "my-working-dir"
+  enable_llm_cache: false
+  enable_hierachical_mode: true
+  embedding_batch_num: 6
+  embedding_func_max_async: 8
+  enable_naive_rag: true
+  neo4j_url: "neo4j://localhost:****"
+  neo4j_auth: ["neo4j", "****"]
