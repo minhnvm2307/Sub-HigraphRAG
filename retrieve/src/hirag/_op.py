@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import json
 import logging
+import random
+import re
 from collections import Counter, defaultdict
-from sklearn.mixture import GaussianMixture
+
 import networkx as nx
+import numpy as np
 import torch
+from sklearn.mixture import GaussianMixture
 
 from .base import CommunityReport, EntityHit, QueryContext, QueryParam
+from .prompt import PROMPTS
+from .utils import clean_str, extract_first_complete_json, is_float_regex, list_of_list_to_csv, split_string_by_multi_markers
 
 logger = logging.getLogger("retrieve.hirag")
 
@@ -92,7 +98,192 @@ def _summarize_members(graph_storage, members: list[str], max_members: int = 8) 
     return ", ".join(top_nodes)
 
 
-def semantic_cluster_layers(graph_storage, vector_index, max_layers: int = 3, min_cluster_size: int = 3) -> list[dict]:
+def _global_cluster_embeddings(embeddings: np.ndarray, dim: int, n_neighbors: int = 15, metric: str = "cosine") -> np.ndarray:
+    try:
+        import umap
+    except ImportError:
+        logger.warning("umap-learn not available, using raw embeddings for clustering")
+        return embeddings
+    if len(embeddings) <= 2:
+        return embeddings
+    n_components = max(2, min(dim, len(embeddings) - 2))
+    return umap.UMAP(n_neighbors=n_neighbors, n_components=n_components, metric=metric).fit_transform(embeddings)
+
+
+def _fit_gaussian_mixture(n_components: int, embeddings: np.ndarray, random_state: int) -> float:
+    gm = GaussianMixture(
+        n_components=n_components,
+        random_state=random_state,
+        n_init=5,
+        init_params="k-means++",
+    )
+    gm.fit(embeddings)
+    return gm.bic(embeddings)
+
+
+def _get_optimal_clusters(embeddings: np.ndarray, max_clusters: int = 50, random_state: int = 0, rel_tol: float = 1e-3) -> int:
+    max_clusters = min(len(embeddings), max_clusters)
+    if max_clusters <= 2:
+        return 1
+    n_clusters = np.arange(1, max_clusters)
+    bics = []
+    prev_bic = float("inf")
+    for n in n_clusters:
+        bic = _fit_gaussian_mixture(int(n), embeddings, random_state)
+        bics.append(bic)
+        if prev_bic != float("inf") and abs(prev_bic - bic) / (abs(prev_bic) + 1e-8) < rel_tol:
+            break
+        prev_bic = bic
+    return int(n_clusters[int(np.argmin(bics))])
+
+
+def _gmm_cluster(embeddings: np.ndarray, threshold: float, random_state: int = 0) -> tuple[list[np.ndarray], int]:
+    n_clusters = _get_optimal_clusters(embeddings, random_state=random_state)
+    gm = GaussianMixture(
+        n_components=n_clusters,
+        random_state=random_state,
+        n_init=5,
+        init_params="k-means++",
+    )
+    gm.fit(embeddings)
+    probs = gm.predict_proba(embeddings)
+    labels = [np.where(prob > threshold)[0] for prob in probs]
+    return labels, n_clusters
+
+
+def _perform_clustering(embeddings: np.ndarray, dim: int, threshold: float) -> list[np.ndarray]:
+    reduced = _global_cluster_embeddings(embeddings, dim=min(dim, max(2, len(embeddings) - 2)))
+    clusters, n_global_clusters = _gmm_cluster(reduced, threshold)
+    all_clusters = [[] for _ in range(len(embeddings))]
+    for cluster_id in range(n_global_clusters):
+        for idx, labels in enumerate(clusters):
+            if cluster_id in labels:
+                all_clusters[idx].append(cluster_id)
+    return [np.array(cluster) for cluster in all_clusters]
+
+
+def _handle_single_entity_extraction(record_attributes: list[str], source_id: str) -> dict | None:
+    if len(record_attributes) < 4 or record_attributes[0] != '"entity"':
+        return None
+    entity_name = clean_str(record_attributes[1].upper())
+    if not entity_name.strip():
+        return None
+    return {
+        "entity_name": entity_name,
+        "entity_type": clean_str(record_attributes[2].upper()),
+        "description": clean_str(record_attributes[3]),
+        "source_id": source_id,
+    }
+
+
+def _handle_single_relationship_extraction(record_attributes: list[str], source_id: str) -> dict | None:
+    if len(record_attributes) < 5 or record_attributes[0] != '"relationship"':
+        return None
+    return {
+        "src_id": clean_str(record_attributes[1].upper()),
+        "tgt_id": clean_str(record_attributes[2].upper()),
+        "description": clean_str(record_attributes[3]),
+        "weight": float(record_attributes[-1]) if is_float_regex(record_attributes[-1]) else 1.0,
+        "source_id": source_id,
+    }
+
+
+def _cluster_source_ids(graph_storage, members: list[str]) -> list[str]:
+    source_ids = []
+    for member in members:
+        node = graph_storage.graph.nodes.get(member, {})
+        raw = node.get("source_ids")
+        if raw:
+            source_ids.extend(json.loads(raw))
+    return sorted(set(source_ids))
+
+
+def _truncate_cluster_nodes(cluster_nodes: list[dict], max_length_in_cluster: int) -> list[dict]:
+    selected = cluster_nodes[:]
+    while selected:
+        total_length = sum(len(node["entity_name"]) + len(node["description"]) for node in selected)
+        if total_length <= max_length_in_cluster:
+            break
+        next_size = max(1, int(len(selected) * 0.8))
+        selected = random.sample(selected, next_size)
+    return selected
+
+
+def _build_cluster_prompt(cluster_nodes: list[dict], meta_entity_types: list[str]) -> str:
+    context = {
+        "tuple_delimiter": PROMPTS["DEFAULT_TUPLE_DELIMITER"],
+        "record_delimiter": PROMPTS["DEFAULT_RECORD_DELIMITER"],
+        "completion_delimiter": PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
+        "meta_attribute_list": meta_entity_types,
+        "entity_description_list": ",".join(
+            f"({node['entity_name']}, {node['description']})" for node in cluster_nodes
+        ),
+    }
+    return PROMPTS["summary_clusters"].format(**context)
+
+
+def _parse_summary_output(output: str, source_ids: list[str]) -> tuple[dict[str, dict], dict[tuple[str, str], dict]]:
+    records = split_string_by_multi_markers(
+        output,
+        [PROMPTS["DEFAULT_RECORD_DELIMITER"], PROMPTS["DEFAULT_COMPLETION_DELIMITER"]],
+    )
+    maybe_nodes: dict[str, dict] = {}
+    maybe_edges: dict[tuple[str, str], dict] = {}
+    merged_source_id = "<SEP>".join(source_ids)
+    for record in records:
+        match = re.search(r"\((.*)\)", record)
+        if match is None:
+            continue
+        record_attributes = split_string_by_multi_markers(match.group(1), [PROMPTS["DEFAULT_TUPLE_DELIMITER"]])
+        entity_row = _handle_single_entity_extraction(record_attributes, merged_source_id)
+        if entity_row is not None:
+            maybe_nodes[entity_row["entity_name"]] = entity_row
+            continue
+        relation_row = _handle_single_relationship_extraction(record_attributes, merged_source_id)
+        if relation_row is not None:
+            maybe_edges[(relation_row["src_id"], relation_row["tgt_id"])] = relation_row
+    return maybe_nodes, maybe_edges
+
+
+def _fallback_cluster_output(cluster_nodes: list[dict], source_ids: list[str]) -> tuple[dict[str, dict], dict[tuple[str, str], dict]]:
+    source_id = "<SEP>".join(source_ids)
+    core_name = ", ".join(node["entity_name"] for node in cluster_nodes[:3])
+    meta_name = f"CLUSTER_{abs(hash('|'.join(sorted(node['entity_name'] for node in cluster_nodes)))) % 10**8}"
+    nodes = {
+        meta_name: {
+            "entity_name": meta_name,
+            "entity_type": "ORGANIZATION",
+            "description": f"Summarized semantic group related to: {core_name}",
+            "source_id": source_id,
+        }
+    }
+    edges = {}
+    for node in cluster_nodes:
+        edges[(node["entity_name"], meta_name)] = {
+            "src_id": node["entity_name"],
+            "tgt_id": meta_name,
+            "description": f"{node['entity_name']} belongs to semantic group {meta_name}",
+            "weight": 1.0,
+            "source_id": source_id,
+        }
+    return nodes, edges
+
+
+def semantic_cluster_layers(
+    graph_storage,
+    vector_index,
+    embedding_func,
+    llm_callable=None,
+    max_layers: int = 3,
+    min_cluster_size: int = 3,
+    reduction_dimension: int = 2,
+    cluster_threshold: float = 0.1,
+    stop_sparsity_threshold: float = 0.98,
+    stop_sparsity_change_rate: float = 0.05,
+    max_length_in_cluster: int = 60000,
+    meta_entity_types: list[str] | None = None,
+) -> list[dict]:
+    meta_entity_types = meta_entity_types or PROMPTS["META_ENTITY_TYPES"]
     if vector_index.embeddings.numel() == 0 or len(vector_index.ids) < min_cluster_size:
         logger.info(
             "Skip semantic clustering: entities=%d min_cluster_size=%d",
@@ -101,111 +292,148 @@ def semantic_cluster_layers(graph_storage, vector_index, max_layers: int = 3, mi
         )
         return []
 
-    current_ids = vector_index.ids[:]
-    current_embeddings = vector_index.embeddings.clone()
-    layers = []
-    logger.info(
-        "Start semantic clustering: entities=%d max_layers=%d min_cluster_size=%d",
-        len(current_ids),
-        max_layers,
-        min_cluster_size,
-    )
+    nodes = []
+    for node_id in vector_index.ids:
+        metadata = vector_index.meta.get(node_id, {})
+        node_data = graph_storage.graph.nodes.get(node_id)
+        if node_data is None:
+            continue
+        nodes.append(
+            {
+                "entity_name": node_id,
+                "entity_type": node_data.get("entity_type", "UNKNOWN"),
+                "description": node_data.get("description", ""),
+                "source_id": "<SEP>".join(json.loads(node_data.get("source_ids", "[]"))),
+                "embedding": vector_index.embeddings[vector_index.ids.index(node_id)].numpy(),
+                "metadata": metadata,
+            }
+        )
+
+    hierarchical_layers = []
+    pre_cluster_sparsity = 0.01
+    logger.info("Start method-1 semantic clustering: entities=%d max_layers=%d", len(nodes), max_layers)
 
     for layer_idx in range(max_layers):
-        if len(current_ids) < min_cluster_size:
-            logger.info(
-                "Stop semantic clustering at layer=%d due to too few entities=%d",
-                layer_idx,
-                len(current_ids),
-            )
+        if len(nodes) < min_cluster_size:
+            logger.info("Stop semantic clustering at layer=%d because nodes=%d", layer_idx, len(nodes))
             break
-        max_k = min(max(2, len(current_ids) // 2), len(current_ids) - 1)
-        if max_k < 2:
-            logger.info("Stop semantic clustering at layer=%d because max_k < 2", layer_idx)
+        embeddings = np.array([node["embedding"] for node in nodes])
+        clusters = _perform_clustering(embeddings, dim=reduction_dimension, threshold=cluster_threshold)
+        flattened = np.concatenate(clusters) if clusters else np.array([])
+        if len(flattened) == 0:
+            logger.info("Stop semantic clustering at layer=%d because no clusters were assigned", layer_idx)
             break
-
-        best_model = None
-        best_bic = None
-        for k in range(2, max_k + 1):
-            model = GaussianMixture(n_components=k, random_state=0, n_init=3)
-            model.fit(current_embeddings.numpy())
-            bic = model.bic(current_embeddings.numpy())
-            logger.debug("Semantic clustering layer=%d k=%d bic=%.4f", layer_idx, k, bic)
-            if best_bic is None or bic < best_bic:
-                best_bic = bic
-                best_model = model
-
-        if best_model is None:
-            logger.warning("Semantic clustering failed to fit a model at layer=%d", layer_idx)
-            break
-
-        labels = best_model.predict(current_embeddings.numpy()).tolist()
-        groups = defaultdict(list)
-        for node_id, label in zip(current_ids, labels):
-            groups[int(label)].append(node_id)
+        unique_clusters = np.unique(flattened)
+        cluster_sizes = Counter(flattened)
+        cluster_sparsity = 1 - sum(size * (size - 1) for size in cluster_sizes.values()) / max(len(nodes) * max(len(nodes) - 1, 1), 1)
+        cluster_sparsity_change_rate = abs(cluster_sparsity - pre_cluster_sparsity) / (pre_cluster_sparsity + 1e-8)
+        pre_cluster_sparsity = cluster_sparsity
         logger.info(
-            "Semantic clustering layer=%d selected_components=%d candidate_groups=%d",
+            "Semantic clustering layer=%d labels=%d nodes=%d sparsity=%.4f delta=%.4f",
             layer_idx,
-            best_model.n_components,
-            len(groups),
+            len(unique_clusters),
+            len(nodes),
+            cluster_sparsity,
+            cluster_sparsity_change_rate,
         )
+        if cluster_sparsity >= stop_sparsity_threshold:
+            logger.info("Stop semantic clustering at layer=%d due to sparsity threshold", layer_idx)
+            break
+        if cluster_sparsity_change_rate <= stop_sparsity_change_rate:
+            logger.info("Stop semantic clustering at layer=%d due to sparsity change threshold", layer_idx)
+            break
 
-        next_ids = []
-        next_embeddings = []
-        layer_nodes = []
-        for cluster_id, members in groups.items():
-            if len(members) < min_cluster_size:
-                logger.debug(
-                    "Skip semantic cluster: layer=%d cluster=%d size=%d",
-                    layer_idx,
-                    cluster_id,
-                    len(members),
-                )
+        next_layer_nodes = []
+        layer_clusters = []
+        for label in unique_clusters:
+            indices = [idx for idx, cluster in enumerate(clusters) if label in cluster]
+            cluster_nodes = [nodes[idx] for idx in indices]
+            logger.info("Semantic cluster layer=%d label=%s size=%d", layer_idx, int(label), len(cluster_nodes))
+            if len(cluster_nodes) < min_cluster_size:
                 continue
-            meta_node = f"cluster:L{layer_idx}:C{cluster_id}"
-            member_indices = [current_ids.index(node_id) for node_id in members]
-            meta_embedding = current_embeddings[member_indices].mean(dim=0)
-            graph_storage.upsert_node(
-                meta_node,
-                id=meta_node,
-                entity_name=meta_node,
-                entity_type="SEMANTIC_CLUSTER",
-                description=_summarize_members(graph_storage, members),
-                members=json.dumps(sorted(members)),
-                layer=int(layer_idx),
-            )
-            for member in members:
-                graph_storage.upsert_edge(
-                    meta_node,
-                    member,
-                    id=f"{meta_node}|semantic_parent|{member}",
-                    relation="semantic_parent",
-                    description=f"{meta_node} groups {member}",
-                    weight=1.0,
-                )
-            next_ids.append(meta_node)
-            next_embeddings.append(meta_embedding)
-            layer_nodes.append({"cluster_node": meta_node, "members": sorted(members)})
 
-        if not next_ids:
-            logger.info("Semantic clustering produced no valid clusters at layer=%d", layer_idx)
+            cluster_nodes = _truncate_cluster_nodes(cluster_nodes, max_length_in_cluster=max_length_in_cluster)
+            source_ids = sorted(set(source_id for node in cluster_nodes for source_id in node["source_id"].split("<SEP>") if source_id))
+            prompt = _build_cluster_prompt(cluster_nodes, meta_entity_types)
+
+            if llm_callable is None:
+                logger.warning("No LLM configured for semantic summary; using fallback output for layer=%d label=%s", layer_idx, int(label))
+                parsed_nodes, parsed_edges = _fallback_cluster_output(cluster_nodes, source_ids)
+            else:
+                llm_output = llm_callable(prompt)
+                parsed_nodes, parsed_edges = _parse_summary_output(llm_output, source_ids)
+                if not parsed_nodes:
+                    logger.warning("LLM semantic summary produced no entities; using fallback output for layer=%d label=%s", layer_idx, int(label))
+                    parsed_nodes, parsed_edges = _fallback_cluster_output(cluster_nodes, source_ids)
+
+            new_entities = list(parsed_nodes.values())
+            if new_entities:
+                new_embeddings = embedding_func([entity["description"] for entity in new_entities]).float()
+            else:
+                new_embeddings = torch.empty(0)
+
+            for entity, embedding in zip(new_entities, new_embeddings):
+                entity["embedding"] = embedding
+                node_id = entity["entity_name"]
+                graph_storage.upsert_node(
+                    node_id,
+                    id=node_id,
+                    entity_name=node_id,
+                    entity_type=entity["entity_type"],
+                    description=entity["description"],
+                    source_ids=json.dumps(source_ids),
+                    semantic_layer=int(layer_idx),
+                    members=json.dumps(sorted(node["entity_name"] for node in cluster_nodes)),
+                )
+                next_layer_nodes.append(entity)
+
+            for relation in parsed_edges.values():
+                src_id = relation["src_id"]
+                tgt_id = relation["tgt_id"]
+                if not graph_storage.graph.has_node(src_id):
+                    continue
+                if not graph_storage.graph.has_node(tgt_id):
+                    continue
+                graph_storage.upsert_edge(
+                    src_id,
+                    tgt_id,
+                    id=f"{src_id}|semantic_relation|{tgt_id}",
+                    relation="semantic_relation",
+                    description=relation["description"],
+                    weight=float(relation["weight"]),
+                    source_ids=json.dumps(source_ids),
+                    semantic_layer=int(layer_idx),
+                )
+
+            vector_index.upsert(
+                (entity["entity_name"], entity["embedding"], {"entity_name": entity["entity_name"], "semantic_layer": layer_idx})
+                for entity in new_entities
+            )
+            layer_clusters.append(
+                {
+                    "label": int(label),
+                    "members": sorted(node["entity_name"] for node in cluster_nodes),
+                    "generated_entities": sorted(entity["entity_name"] for entity in new_entities),
+                    "generated_relations": len(parsed_edges),
+                }
+            )
+
+        if not next_layer_nodes:
+            logger.info("Semantic clustering produced no next-layer entities at layer=%d", layer_idx)
             break
 
-        vector_index.upsert(
-            (node_id, emb, {"entity_name": node_id, "semantic_layer": layer_idx})
-            for node_id, emb in zip(next_ids, next_embeddings)
-        )
-        layers.append({"layer": layer_idx, "clusters": layer_nodes})
-        logger.info(
-            "Semantic clustering layer=%d completed: new_cluster_nodes=%d",
-            layer_idx,
-            len(next_ids),
-        )
-        current_ids = next_ids
-        current_embeddings = torch.stack(next_embeddings, dim=0)
+        hierarchical_layers.append({"layer": layer_idx, "clusters": layer_clusters})
+        dedup = {}
+        for node in next_layer_nodes:
+            dedup[node["entity_name"]] = node
+        nodes = list(dedup.values())
+        logger.info("Semantic clustering layer=%d completed: next_entities=%d", layer_idx, len(nodes))
+        if len(nodes) <= 2:
+            logger.info("Stop semantic clustering at layer=%d because deduplicated entities=%d", layer_idx, len(nodes))
+            break
 
-    logger.info("Semantic clustering finished: layers=%d", len(layers))
-    return layers
+    logger.info("Semantic clustering finished: layers=%d", len(hierarchical_layers))
+    return hierarchical_layers
 
 
 def structural_communities(graph_storage) -> dict[str, dict]:
@@ -266,7 +494,7 @@ def structural_communities(graph_storage) -> dict[str, dict]:
     return result
 
 
-def build_community_reports(graph_storage, communities: dict[str, dict]) -> dict[str, dict]:
+def build_community_reports(graph_storage, communities: dict[str, dict], llm_callable=None) -> dict[str, dict]:
     reports = {}
     logger.info("Build community reports: communities=%d", len(communities))
     for community_id, payload in communities.items():
@@ -277,20 +505,45 @@ def build_community_reports(graph_storage, communities: dict[str, dict]) -> dict
             data = graph_storage.graph.edges[src, tgt]
             edge_labels.append(data.get("relation", "related_to"))
         relation_counts = Counter(edge_labels)
-        summary = (
-            f"Community {community_id} contains {len(node_names)} nodes and "
-            f"{len(payload['edges'])} edges. Top entities: {_summarize_members(graph_storage, node_names)}. "
-            f"Top relations: {', '.join(rel for rel, _ in relation_counts.most_common(5))}."
-        )
+        rows = [["id", "entity", "type", "description"]]
+        for idx, node_name in enumerate(node_names):
+            node_data = graph_storage.graph.nodes[node_name]
+            rows.append([idx, node_name, node_data.get("entity_type", "UNKNOWN"), node_data.get("description", "")])
+        relation_rows = [["id", "source", "target", "relation", "description"]]
+        for idx, edge_id in enumerate(payload["edges"]):
+            src, tgt = edge_id.split("|", 1)
+            edge_data = graph_storage.graph.edges[src, tgt]
+            relation_rows.append([idx, src, tgt, edge_data.get("relation", "related_to"), edge_data.get("description", "")])
+        community_input = f"Entities:\n```csv\n{list_of_list_to_csv(rows)}\n```\nRelationships:\n```csv\n{list_of_list_to_csv(relation_rows)}\n```"
+        report_json = None
+        if llm_callable is not None:
+            report_json = extract_first_complete_json(llm_callable(PROMPTS["community_report"].format(input_text=community_input)))
+        if report_json is None:
+            summary = (
+                f"Community {community_id} contains {len(node_names)} nodes and "
+                f"{len(payload['edges'])} edges. Top entities: {_summarize_members(graph_storage, node_names)}. "
+                f"Top relations: {', '.join(rel for rel, _ in relation_counts.most_common(5))}."
+            )
+            report_json = {
+                "title": f"Community {community_id}",
+                "summary": summary,
+                "rating": float(min(10.0, len(payload["edges"]))),
+                "rating_explanation": "Fallback report generated without LLM.",
+                "findings": [],
+            }
         reports[community_id] = {
             "community_id": community_id,
             "level": payload["level"],
-            "title": f"Community {community_id}",
-            "summary": summary,
+            "title": report_json.get("title", f"Community {community_id}"),
+            "summary": report_json.get("summary", ""),
             "node_ids": node_names,
             "edge_ids": payload["edges"],
-            "rating": float(len(payload["edges"])),
-            "metadata": {"relation_counts": dict(relation_counts)},
+            "rating": float(report_json.get("rating", len(payload["edges"]))),
+            "metadata": {
+                "relation_counts": dict(relation_counts),
+                "rating_explanation": report_json.get("rating_explanation", ""),
+                "findings": report_json.get("findings", []),
+            },
         }
     logger.info("Community reports built: reports=%d", len(reports))
     return reports

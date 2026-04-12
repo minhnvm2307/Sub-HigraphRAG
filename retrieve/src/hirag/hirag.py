@@ -17,6 +17,7 @@ from ._op import (
     structural_communities,
 )
 from .base import QueryContext, QueryParam
+from .prompt import PROMPTS
 from .storage import EntityVectorIndex, GraphStorage, JsonKVStorage
 
 logger = logging.getLogger("retrieve.hirag")
@@ -39,8 +40,14 @@ class HiRAG:
     working_dir: str
     namespace: str = "retrieve_hirag"
     text_encoder: object | None = None
+    llm_callable: object | None = None
     semantic_max_layers: int = 3
     semantic_min_cluster_size: int = 3
+    semantic_cluster_threshold: float = 0.1
+    semantic_stop_sparsity_threshold: float = 0.98
+    semantic_stop_sparsity_change_rate: float = 0.05
+    semantic_max_length_in_cluster: int = 60000
+    meta_entity_types: list[str] = field(default_factory=lambda: PROMPTS["META_ENTITY_TYPES"][:])
     log_level: str = "INFO"
     graph: GraphStorage = field(init=False)
     entities: EntityVectorIndex = field(init=False)
@@ -53,11 +60,12 @@ class HiRAG:
         os.makedirs(root, exist_ok=True)
         self.root = root
         logger.info(
-            "Initialize HiRAG: root=%s namespace=%s semantic_max_layers=%d semantic_min_cluster_size=%d",
+            "Initialize HiRAG: root=%s namespace=%s semantic_max_layers=%d semantic_min_cluster_size=%d llm=%s",
             self.root,
             self.namespace,
             self.semantic_max_layers,
             self.semantic_min_cluster_size,
+            "enabled" if self.llm_callable is not None else "disabled",
         )
         self.graph = GraphStorage(root)
         self.entities = EntityVectorIndex(root)
@@ -81,11 +89,18 @@ class HiRAG:
         semantic_layers = semantic_cluster_layers(
             self.graph,
             self.entities,
+            embedding_func=self._embedding_func,
+            llm_callable=self.llm_callable,
             max_layers=self.semantic_max_layers,
             min_cluster_size=self.semantic_min_cluster_size,
+            cluster_threshold=self.semantic_cluster_threshold,
+            stop_sparsity_threshold=self.semantic_stop_sparsity_threshold,
+            stop_sparsity_change_rate=self.semantic_stop_sparsity_change_rate,
+            max_length_in_cluster=self.semantic_max_length_in_cluster,
+            meta_entity_types=self.meta_entity_types,
         )
         communities = structural_communities(self.graph)
-        reports = build_community_reports(self.graph, communities)
+        reports = build_community_reports(self.graph, communities, llm_callable=self.llm_callable)
 
         self.community_reports.clear()
         self.community_reports.update(reports)
@@ -123,11 +138,14 @@ class HiRAG:
         return self.query(sample["question"], sample["q_emb"], param=param)
 
     def embed_query(self, question: str) -> torch.Tensor:
+        return self._embedding_func([question])[0]
+
+    def _embedding_func(self, texts: list[str]) -> torch.Tensor:
         if self.text_encoder is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
             self.text_encoder = GTELargeEN(device=device)
             logger.info("Initialized text encoder for query embedding on device=%s", device)
-        return self.text_encoder.embed([question])[0]
+        return self.text_encoder.embed(texts)
 
     def persist(self) -> None:
         logger.info("Persist HiRAG artifacts to disk")

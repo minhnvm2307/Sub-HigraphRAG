@@ -13,6 +13,15 @@ from retrieve.src.hirag.hirag import setup_logger
 
 def main(args) -> None:
     setup_logger(args.log_level)
+    llm_callable = None
+    if args.llm_backend == "reason":
+        from reason.llm_utils import get_outputs, llm_init
+
+        llm = llm_init(args.llm_model)
+
+        def llm_callable(prompt: str) -> str:
+            messages = [{"role": "user", "content": prompt}]
+            return get_outputs(llm(messages=messages), args.llm_model)
 
     config_file = args.config_file or f"retrieve/configs/retriever/{args.dataset}.yaml"
     config = load_yaml(config_file)
@@ -30,6 +39,7 @@ def main(args) -> None:
     hirag = HiRAG(
         working_dir=args.working_dir,
         namespace=namespace,
+        llm_callable=llm_callable,
         semantic_max_layers=args.semantic_max_layers,
         semantic_min_cluster_size=args.semantic_min_cluster_size,
         log_level=args.log_level,
@@ -74,6 +84,8 @@ if __name__ == "__main__":
     parser.add_argument("--community_level", type=int, default=0)
     parser.add_argument("--semantic_max_layers", type=int, default=3)
     parser.add_argument("--semantic_min_cluster_size", type=int, default=3)
+    parser.add_argument("--llm_backend", type=str, default="none", choices=["none", "reason"])
+    parser.add_argument("--llm_model", type=str, default="gpt-4o-mini")
     parser.add_argument("--log_level", type=str, default="INFO")
     parser.add_argument("--skip_no_path", action="store_true")
     main(parser.parse_args())
