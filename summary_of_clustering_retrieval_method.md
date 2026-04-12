@@ -1,10 +1,21 @@
 # HiRAG Graph Clustering, Hierarchical Query, and MLP Integration Plan
 
+# MAIN GOAL
+Your task is to find the way to intergrate method 1' s code to retrieve folder of method 2 so that it indexing and retrieve on the dataset schema (dataset that been embedding using gte_large)
+Refactor all the code so that hi_rag compatible with main graphrag method (method 2)
+Remain only need code, clean the code by use less files as possible 
+The desired code should be in retrieve.src.hirag/
+with the code of storage and graphload -> graphml files
+code to build indexing (GMM layers and Leidein + community reports layers) -> store
+code like _op.py to intergrate method 1 and method 2 (local + global) to answer the answer of dataset
+
 ## 1. Purpose of this document
 
 This file is a transfer note for reusing the current HiRAG graph-retrieval design in another project.
 
-The current project has two different clustering layers:
+The current project has two different retrieval methods:
+
+Methods 1: hi_retrieval/ (retrievel by indexing the graph by GMM and Community reports using leidein algorithm)
 
 1. Semantic hierarchical clustering during entity extraction
    - Implemented with embedding-based clustering and GMM-style grouping.
@@ -21,7 +32,15 @@ The hierarchical query pipeline then combines:
 - shortest-path bridge knowledge,
 - source text chunks.
 
-This is the main logic to preserve when moving to another repository.
+This is the main logic to preserve when moving to another repository (Method 2).
+
+Method 2: retrieve/ (the main methods that you must not change any):
+
+- This load datafiles and emb entity and relation of dataset that have question -> graph and answer with 1 graph to many question
+- Build MLP model to predict triples scores and ranking to choose top K to get subgraph related to topic entities
+
+
+# Some summary of the core of method 1
 
 ## 2. Core modules and responsibilities
 
