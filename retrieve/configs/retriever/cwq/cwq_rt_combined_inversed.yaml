@@ -1,0 +1,40 @@
+task: 'retriever'
+
+env:
+  num_threads: 16
+  seed: 42
+  deterministic: true
+
+dataset:
+  name: 'cwq'
+  text_encoder_name: 'gte-large-en-v1.5'
+
+retriever:
+  topic_pe: true
+  relation_topic_source: 'gte'
+  relation_score_mode: 'hybrid'
+  relation_score_alpha: 0.5
+  use_relation_topic_mask: true
+  relation_topic_cache: 'auto'
+  topk_rt: 5
+  dde_mode: 'both'
+  weighted_dde_floor: 0.1
+  DDE_kwargs:
+    num_rounds: 2
+    num_reverse_rounds: 2
+
+loss:
+  type: 'bce'
+  pos_weight_mode: 'inversed'
+  pos_weight: null
+
+optimizer:
+  lr: 1e-3
+
+eval:
+  k_list: '100'
+
+train:
+  num_epochs: 10000
+  patience: 10
+  save_prefix: 'cwq_rt_combined_inversed'

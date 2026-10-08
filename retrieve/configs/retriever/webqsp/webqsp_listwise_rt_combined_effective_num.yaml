@@ -1,0 +1,47 @@
+task: 'retriever'
+
+env:
+  num_threads: 16
+  seed: 42
+  deterministic: true
+
+dataset:
+  name: 'webqsp'
+  text_encoder_name: 'gte-large-en-v1.5'
+
+retriever:
+  topic_pe: true
+  use_relation_topics_mlp: true
+  use_relation_topics_dde: true
+  relation_topic_topk: 5
+  relation_topic_lexical_alpha: 0.5
+  DDE_kwargs:
+    num_rounds: 2
+    num_reverse_rounds: 2
+  listwise:
+    enabled: true
+    top_n: 500
+    num_heads: 4
+    num_layers: 2
+    d_model: 256
+    dim_feedforward: 1024
+    dropout: 0.1
+    rank_margin: 0.0001
+    selection_metric: 'ans_recall@100'
+
+loss:
+  # Effective-number BCE only: no margin or InfoNCE contribution.
+  type: 'bce'
+  pos_weight_mode: 'effective_num'
+  beta: 0.999
+
+optimizer:
+  lr: 1e-3
+
+eval:
+  k_list: '50,100,200,400,500'
+
+train:
+  num_epochs: 10000
+  patience: 50
+  save_prefix: 'webqsp_two_stage_listwise_rt_combined_effective_only'

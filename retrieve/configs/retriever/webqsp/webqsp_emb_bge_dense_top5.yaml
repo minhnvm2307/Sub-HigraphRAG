@@ -1,0 +1,39 @@
+task: 'retriever'
+
+env:
+  num_threads: 16
+  seed: 42
+  deterministic: true
+
+dataset:
+  name: 'webqsp'
+  text_encoder_name: 'gte-large-en-v1.5'
+
+retriever:
+  topic_pe: true
+  relation_topic_source: 'bge'
+  relation_topic_bge_format: 'natural'
+  relation_score_mode: 'semantic'
+  use_relation_topic_mask: true
+  topk_rt: 5
+  dde_mode: 'both'
+  weighted_dde_floor: 0.1
+  DDE_kwargs:
+    num_rounds: 2
+    num_reverse_rounds: 2
+
+loss:
+  type: 'bce'
+  pos_weight_mode: 'static'
+  pos_weight: 200.0
+
+optimizer:
+  lr: 1e-3
+
+eval:
+  k_list: '100'
+
+train:
+  num_epochs: 10000
+  patience: 10
+  save_prefix: 'webqsp_s4_5a_bge_dense_top5'

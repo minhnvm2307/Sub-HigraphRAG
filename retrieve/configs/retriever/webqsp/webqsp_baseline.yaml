@@ -1,0 +1,36 @@
+task: 'retriever'
+
+env:
+  num_threads: 16
+  seed: 42
+  deterministic: true
+
+dataset:
+  name: 'webqsp'
+  text_encoder_name: 'gte-large-en-v1.5'
+
+retriever:
+  topic_pe: true
+  relation_topic_source: 'gte'
+  relation_score_mode: 'none'
+  use_relation_topic_mask: false
+  dde_mode: 'baseline'
+  DDE_kwargs:
+    num_rounds: 2
+    num_reverse_rounds: 2
+
+loss:
+  type: 'bce'
+  pos_weight_mode: 'none'
+  pos_weight: null
+
+optimizer:
+  lr: 1e-3
+
+eval:
+  k_list: '100'
+
+train:
+  num_epochs: 10000
+  patience: 10
+  save_prefix: 'webqsp_baseline'
