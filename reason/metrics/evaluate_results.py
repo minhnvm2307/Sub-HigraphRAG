@@ -106,13 +106,14 @@ def eval_results(predict_file, cal_f1=True, topk = -1, subset=False, bad_samples
     f1_list = []
     precission_list = []
     recall_list = []
-    if "webqsp" in predict_file:
+    # dataset from the results/KGQA/<dataset>/ folder: a retrieval name may contain the other dataset (e.g. rbfnbwebqsp on cwq)
+    ds_dir = re.search(r"/(webqsp|cwq)/", predict_file)
+    if (ds_dir.group(1) == "webqsp") if ds_dir else ("webqsp" in predict_file):
         # samples_to_eval_path = "./scored_triples/webqsp_240912_unidir_test.pth"
         samples_to_eval_path = "./scored_triples/retrieval_result.pth"
         dataset_name = "webqsp"
-    elif "cwq" in predict_file:
-        # samples_to_eval_path = "./scored_triples/cwq_240907_unidir_test.pth"
-        samples_to_eval_path = "./scored_triples/retrieval_result.pth"
+    elif (ds_dir.group(1) == "cwq") if ds_dir else ("cwq" in predict_file):
+        samples_to_eval_path = "./scored_triples/cwq_240907_unidir_test.pth"  # retrieval_result.pth holds WebQSP ids only
         dataset_name = "cwq"
     else:
         raise NotImplementedError

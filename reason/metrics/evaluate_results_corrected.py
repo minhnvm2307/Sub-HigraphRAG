@@ -255,13 +255,14 @@ def eval_results(predict_file, cal_f1=True, split=None, subset=False, bad_sample
     total_match = 0
     hal_score_list = []
 
-    if "webqsp" in predict_file:
+    # dataset from the results/KGQA/<dataset>/ folder: a retrieval name may contain the other dataset (e.g. rbfnbwebqsp on cwq)
+    ds_dir = re.search(r"/(webqsp|cwq)/", predict_file)
+    if (ds_dir.group(1) == "webqsp") if ds_dir else ("webqsp" in predict_file):
         # samples_to_eval_path = "./scored_triples/webqsp_240912_unidir_test.pth"
         samples_to_eval_path = "./scored_triples/retrieval_result.pth"
         dataset_name = "webqsp"
-    elif "cwq" in predict_file:
-        # samples_to_eval_path = "./scored_triples/cwq_240907_unidir_test.pth"
-        samples_to_eval_path = "./scored_triples/retrieval_result.pth"
+    elif (ds_dir.group(1) == "cwq") if ds_dir else ("cwq" in predict_file):
+        samples_to_eval_path = "./scored_triples/cwq_240907_unidir_test.pth"  # retrieval_result.pth holds WebQSP ids only
         dataset_name = "cwq"
     else:
         raise NotImplementedError
@@ -352,7 +353,7 @@ def eval_results(predict_file, cal_f1=True, split=None, subset=False, bad_sample
                 hit = eval_hit(prediction, answer, double_check)
 
                 if not subset and not bad_samples and has_triplets_for_hal:
-                    subgraph_ent = get_all_retrieved_entities(triplets_dict[id])
+                    subgraph_ent = get_all_retrieved_entities(triplets_dict.get(id, []))  # RoG file lacks a few ids
                     hal_score, stats = eval_hal_score(prediction, answer, double_check, samples_to_eval[id]['a_entity_in_graph'], no_ans_flag, subgraph_ent, stats)
                 else:
                     hal_score = 0

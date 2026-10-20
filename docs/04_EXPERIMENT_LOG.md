@@ -1154,3 +1154,266 @@ Bảng đầy đủ ở `relrag/runs/exp35_report.md` (script `relrag/exp35_repo
   - Lọc theo điều kiện "mọi topic entity đều có subgraph" thì được 723 câu.
   - Sau khi bỏ các câu không có đáp án trong graph, số câu dự kiến gần 874.
 - **Hệ quả:** mọi số GrailQA ở EXP-32 (và bảng GrailQA trong doc báo cáo) **không so được với paper**. Chúng chỉ là một phép thử OOD trên tập dev, theo kiểu khác. Cần dựng lại tập và chấm lại toàn bộ.
+- **Đã dựng (10-11)**: `ext_data.py convert grailqa_paper` → `data_ext/grailqa_paper/test.pkl`.
+  - 995 câu train có topic trong ODA. Giữ **728 câu** có đáp án (entity) nằm trong subgraph. Bỏ 176 câu đáp án entity không có trong subgraph, 90 câu `count` (đáp án là số), 1 câu so sánh.
+  - Không cắt theo kích thước: trung vị 11.6k triple, p90 50.6k, max 184k. Nếu cắt ở 30k như EXP-32 thì chỉ còn 584 câu.
+  - Domain: religion 89, computer 68, biology 66, digicams 63, medicine 44. Hop: 342 / 241 / 144 (1/2/3). 716 câu 1 topic.
+  - Paper giữ 874 câu. Khoảng chênh gần với 90 câu `count` cộng các câu mà paper không yêu cầu đáp án nằm trong graph. Với ansR thì cần đáp án là entity trong graph, nên dùng 728.
+  - Còn thiếu: embedding GTE (652k entity, 4k relation, cần GPU).
+
+## EXP-38 — Chạy lại RAPL bằng chính code của tác giả, WebQSP → CWQ (10-10 → 10-11)
+Chi tiết, các điểm khác code gốc (D1–D12) và giải thích về rò rỉ `topic_labels`: `rapl_faithful/REPORT_DEVIATIONS.md`.
+- **Retrieval:** checkpoint `webqsp.pt` của tác giả; `model_inference.py` chạy nguyên văn trên svuet; nhãn test kiểu SP.
+  - 3,531/3,531 câu, trung bình **123.5 triple/câu** (paper nói khoảng 50).
+  - Chi phí dựng dữ liệu: line graph 77 MB/câu, tổng khoảng 175 GB × 2, đã giảm bằng D12; dựng graph 3.5 giờ, post-process 1 giờ, inference 2.6 giờ, đều đơn luồng.
+- **LLM:** Llama-3.1-8B qua OpenRouter (DeepInfra fp8, greedy), $0.20. GPU của svuet hỏng tản nhiệt (99–103 °C, xung nhịp 105–210 MHz), không dùng được.
+- **Kết quả (3,531 câu):**
+  - Hit trên toàn bộ text đã lưu (có cả prompt) **70.6**;
+  - Hit chỉ trên phần trả lời **48.1**;
+  - Dòng "The answer is:" 29.0, Macro-F1 24.9;
+  - Paper: 64.1 / 53.6.
+- **Kết luận:** con số của paper không tái hiện được với cách chấm trên câu trả lời. Chỉ khi chấm cả prompt (đúng là file tác giả có lưu kèm prompt) mới vượt được mức của paper.
+
+## EXP-39 — RBF-Ret: retriever chấm điểm phân rã theo bước (10-11)
+Kế hoạch và giả thuyết: `docs/11_KE_HOACH_TUAN_1011.md` §3–4, §7.
+- **Mô hình** (`retrieve/exp_qrdde/rbf.py`, `qrdde.py --feat rbfonly`):
+  - Chạy trên entity graph. Không có MLP chấm triple, không có DDE.
+  - Nhân tử một bước dùng chung cho mọi bước: π(r|q) = σ(MLP[z_q; z_r; z_q⊙z_r; lex; cos]), tách hai chiều fwd/rev.
+  - Max-product Bellman-Ford từ từng anchor, T = 3. Điểm triple là log của đường đi tốt nhất qua triple đó (lấy max qua các anchor).
+  - Loss BCE trên nhãn SP, như SubgraphRAG. 0.85M tham số, train trên CPU khoảng 40 s/epoch.
+- **WebQSP test (in-dist, 1,559 câu, `gate_webqsp_rbfonly.md`):** ansR@50/100/200 = 89.36 / 93.85 / 96.97. SubgraphRAG official được 90.38 / 94.42 / 96.94, REL-RAG 90.60 / 94.84 / 96.95. → **Gate in-dist PASS** (không thua có ý nghĩa ở budget nào). ansHit thua SubgraphRAG 2.4 / 1.5 điểm ở @50 / @100 (chỉ số phụ).
+- **WebQSP → CWQ (2,848 câu, `gate_cwq_transfer_rbfonly.md`), không dùng mẹo inference:** ansR@50/100/200/500 = 80.28 / 87.50 / 93.55 / 97.90.
+  - So với SubgraphRAG train trên WebQSP: +10.2 / +7.9 / +5.9 / +3.1.
+  - So với REL-RAG: +18.4 / +15.2 / +14.2 / +12.7.
+  - Mọi ô đều có CI > 0, kể cả SP-R và GPT-R. → **Gate generalisation PASS.**
+  - Budget efficiency: RBF@k ≈ SubgraphRAG@2k (CI chứa 0). AER chưa từng đạt được điều này.
+  - Vẫn thấp hơn WL+ADR+AER (83.2 / 89.8 / 94.7), là bản dùng 3 mẹo inference.
+- **Theo nhóm** (ansR@50): tổ hợp mới 83.7 so với DDE 49.2. Câu 1 topic 85.6, gần trần train CWQ (86.1). Điểm yếu: câu ≥ 2 topic (75.3, so với 84.4 của WL+ADR+AER) và câu 1 bước (85.7, so với 94.5 của DDE).
+- **Ablation / kết quả âm:**
+  - π chỉ dùng cổng 6 tham số (`webqsp_rbfgate_s42`): val ansR@50 dừng ở 48.6.
+  - Soft-AND, π đối xứng, chia budget đều theo anchor: đều làm giảm. Chi tiết trong docs/11 §7.
+- **Đang chạy:**
+  - ψ(v|q) (`webqsp_rbfnode_s42`): val thấp hơn bản không có ψ, 84 so với 88 ở cùng số epoch.
+  - Nhãn rational path (`webqsp_rbfrat_s42`, `make_rational.py`).
+  - Train CWQ (`cwq_rbfonly_s42`, CPU, ước khoảng 9–20 giờ).
+- **Cập nhật 10-11 (sáng): biến thể RBF, tất cả train trên WebQSP, không dùng mẹo inference.**
+
+  | Biến thể | WebQSP test ansR@50/100/200 | CWQ transfer ansR@50/100/200 | Gate in-dist / transfer |
+  |---|---|---|---|
+  | RBF-only | 89.36 / 93.85 / 96.97 | 80.3 / 87.5 / 93.5 | PASS / PASS |
+  | **RBF + non-backtracking (train với nb)** | 89.63 / 93.85 / **97.73** | **81.8 / 89.8 / 94.6** | PASS (@200 hơn SubgraphRAG có ý nghĩa, +0.79) / PASS (+11.8 / +10.2 / +6.9 so với SubgraphRAG) |
+  | RBF + nb + nhãn SP ∪ rational | 89.53 / 94.40 / 97.58 | 82.0 / 89.5 / 94.6 | PASS / PASS |
+  | RBF nhãn rational, nb chỉ lúc test | 89.81 / 93.97 / 96.97 | 82.1 / 89.0 / 94.8 | — |
+  | Tham chiếu: WL + ADR + AER (3 mẹo) | — | 83.2 / 89.8 / 94.7 | |
+
+  - nb giúp rõ ở câu so sánh (+7.6), câu cực trị (+5.5) và câu 1 bước (+3.9 / +5.2), nhưng giảm ở câu ≥ 3 bước (66.7 → 59.9).
+  - Nhãn rational giúp câu 1 bước và câu conjunction, nhưng giảm ở câu ≥ 3 bước.
+- **Hybrid (train trên vast A4000, `vast/rbf_hybrid_remote.sh`):**
+  - `webqsp_rbfmlp_nb_s42`: MLP entity, không DDE, cộng 4 feature đường đi RBF. Val ansR@50 **91.52**.
+  - `webqsp_wlrbf_nb_s42`: WL cộng RBF. Val ansR@50 **91.62**.
+  - So với WL 91.01 và DDE 89.14. Test và CWQ được chấm trên CPU local (`queue_hybrid_probe.sh`).
+- **Đang chạy:**
+  - Seed 0 của `rbfnb` và `rbfmlp_nb` trên vast.
+  - Embedding GTSQA trên vast.
+  - Train CWQ cho `rbfonly` trên CPU local (epoch 16, val ansR@50 90.3).
+  - GrailQA tập paper (`queue_grailqa_paper.sh`).
+- **GrailQA, tập của paper (728 câu, train trên WebQSP, sơ bộ 10-11):** ansR@50/100/200.
+  - RBF-only: **49.9 / 57.8 / 62.3**.
+  - SubgraphRAG repro (DDE): 40.3 / 48.3 / 54.4.
+  - DDE + ADR + AER: 42.4 / 51.4 / 59.3.
+  - Theo số bước: 2 bước 47.2 so với 29.0 (DDE). 3 bước 12.3 so với 9.3 (DDE) và 14.5 (AER).
+  - Theo domain: biology 50.8 so với 29.4. Digicams thấp ở cả hai (22.3 so với 21.5).
+  - Đang chạy: các biến thể nb, WL (8 phần), REL-RAG.
+- **GrailQA, tập của paper (728 câu, train trên WebQSP, 10-11), ansR@50/100/200:**
+
+  | Phương pháp | @50 / @100 / @200 |
+  |---|---|
+  | SubgraphRAG repro | 40.3 / 48.3 / 54.4 |
+  | WL | 51.9 / 57.9 / 62.6 |
+  | WL + ADR + AER | 54.7 / 62.9 / 67.7 |
+  | RBF-only | 49.9 / 57.8 / 62.3 |
+  | RBF + nb (chỉ lúc test) | 58.1 / 65.4 / 71.3 |
+  | **RBF + nb (train với nb)** | **58.8 / 67.1 / 73.2** |
+  | RBF + nb + nhãn SP ∪ rational | 58.8 / 69.1 / 75.0 |
+  | RBF nhãn rational + nb | 61.5 / 69.2 / 76.9 |
+
+  - Đi không quay lui giúp nhiều hơn trên GrailQA (+8.2 @50) so với CWQ (+0.8), vì các domain Freebase có nhiều hub và nút type.
+  - Đang chạy REL-RAG, sau đó bootstrap có ghép cặp.
+- **GrailQA tập paper, đủ baseline** (`relrag/runs/grail_report_paper.md`):
+  - REL-RAG repro (path_bf): 42.7 / 49.5 / 54.7.
+  - Bootstrap ghép cặp, RBF+nb (train với nb) so với từng baseline:
+    - SubgraphRAG: **+18.5 / +18.8 / +18.7**.
+    - REL-RAG: **+16.1 / +17.7 / +18.4**.
+    - WL + ADR + AER: +4.1 / +4.3 / +5.4.
+    - Mọi CI 95% đều > 0.
+  - → **Gate WebQSP → GrailQA PASS.** Script: `relrag/ext_boot.py`.
+- **Seed 0 của RBF+nb** (`webqsp_rbfnb_s0`, train trên vast):
+  - WebQSP 88.78 / 94.11 / 97.28. **Gate in-dist FAIL ở @50**: −1.59 so với SubgraphRAG official, CI [−2.89, −0.36]; −1.82 so với REL-RAG. @100 và @200 hoà.
+  - CWQ transfer 82.0 / 88.5 / 94.7, gate PASS. Nhóm tổ hợp mới 80.8 (seed 42: 84.0).
+  - → RBF+nb thuần ổn định khi transfer, nhưng in-dist @50 thấp hơn khoảng 1 điểm (trung bình hai seed 89.2 so với 90.4). RBF-PoE nhắm đúng vào khoảng hụt này.
+- **LỖI ĐÃ SỬA (10-11 trưa): `torch_scatter.scatter_max` điền 0 vào ô không nhận được message, chứ không phải −∞.**
+  - Nhánh không-nb của RBF tách bước xuôi và bước ngược thành hai lần scatter. Vì vậy nút nào không có cạnh vào, hoặc không có cạnh ra (mọi nút lá), đều nhận điểm 0, tức được đối xử như một anchor phụ. Soft-AND (backward) cũng dính lỗi này.
+  - Nhánh **nb không bị**: mọi bước gom vào một lần scatter, nên ô rỗng chỉ có thể là nút cô lập, không ảnh hưởng điểm triple. Đây là lý do nhánh nb khớp brute force.
+  - Đã sửa bằng `rbf.smax`: ô rỗng gán NEG. Cả ba phép tính (nb, không-nb, completion) giờ khớp brute force tuyệt đối, kiểm trên 300 đồ thị ngẫu nhiên mỗi loại.
+  - **Ảnh hưởng tới kết quả:**
+    - Các run train **không có nb** đều được train với lỗi: `webqsp_rbfonly_s42`, `webqsp_rbfrat_s42`, `rbfgate`, `rbfnode`, `cwq_rbfonly_s42`. Run cuối đã dừng và thay bằng `cwq_rbfnb_s42`.
+    - Các kết luận về soft-AND và π đối xứng được rút ra trên checkpoint dính lỗi.
+    - Phần lợi ích tôi gán cho "nb" (+0.85 WebQSP, +8.2 GrailQA khi chỉ bật lúc test) **có thể một phần là do sửa lỗi**. Cần train lại bản không-nb đã sửa để tách hai phần.
+    - Các run **có nb** (`rbfnb_s42/s0`, `rbfnb_union`, `rbfmlp_nb`, `wlrbf_nb`, `rbfpoe_nb`) **không bị ảnh hưởng**.
+- **Điểm max-marginal của đường đi trọn vẹn (`--rbf_mm`, 10-11 chiều).** Ràng buộc kết thúc dựa trên cấu trúc, không có tham số: walk chỉ được dừng ở entity có text, vì CVT không bao giờ là đáp án. Điểm của mỗi triple là điểm của walk trọn vẹn tốt nhất đi qua nó (forward × completion). Kiểm chính xác bằng brute force. Mới bật lúc test trên `webqsp_rbfnb_s42`, chưa train lại:
+  - **WebQSP:** 89.63 / 93.85 / 97.73 → **91.37 / 95.18 / 98.05**. Gate PASS; @200 hơn SubgraphRAG có ý nghĩa (+1.11), GPT-R@50 +2.09 có ý nghĩa, SP-R@100 −1.17.
+  - **WebQSP → CWQ:** 81.8 / 89.8 / 94.6 → **87.1 / 92.1 / 96.0**, vượt cả trần SubgraphRAG official train trên CWQ (86.2 / 91.4 / 95.4).
+    - So với SubgraphRAG: ansR +17.0 / +12.6 / +8.3 / +4.0, SP-R +8.7, GPT-R +13.2 @50. So với REL-RAG: +25.2 @50. Mọi ô có ý nghĩa.
+    - **Budget efficiency PASS**: RBF@50 hơn SubgraphRAG@100 +7.5.
+  - **Theo nhóm:** tổ hợp mới 85.7; tổ hợp đã thấy 85.9 (trước đó 76.5); ≥ 2 topic 85.6 (WL+ADR+AER 84.4); ≥ 3 bước 73.1 (trước đó 59.9).
+  - **Cơ chế:** điểm theo tiền tố chỉ giảm dần dọc đường đi, nên bước 1 sang CVT luôn đứng trên bước tiếp theo, và "anchor → member → [80 CVT]" lấp đầy budget. Max-marginal trả cho bước vào CVT đúng điểm của phần hoàn chỉnh tốt nhất của nó.
+- **Hybrid seed 0** (`webqsp_rbfmlp_nb_s0`), nhóm tổ hợp mới trên CWQ: head MLP 62.7, head đường đi 81.8, hợp nhất 70.9 (seed 42: 51.2 / 80.8 / 66.0). → Cơ chế "MLP học thuộc tổ hợp" lặp lại qua seed.
+- **Đang chạy:** `webqsp_rbfnbmm_s42` (train với nb + mm), để biết train với mm có hơn chỉ bật mm lúc test không.
+- **mm trên GrailQA và GTSQA:**
+  - GrailQA: mm gần như không đổi gì (+0.1, CI chứa 0), có lẽ vì subgraph ODA ít nút trung gian. RBF+nb+mm 58.9 / 67.1 / 73.1. So với SubgraphRAG +18.6, so với REL-RAG +16.3 @50.
+  - GTSQA (Wikidata, không có CVT): mm không có tác dụng.
+- **WebQSP → GTSQA (1,622 câu), RBF+nb:**
+  - ansR@50/100/200 = 57.7 / 64.9 / 71.9. Gold-subgraph recall@50 53.7, gold full@50 32.7.
+  - Bootstrap ghép cặp: so với SubgraphRAG (DDE, 35.4 / 41.2 / 47.9) **+22.3 / +23.7 / +24.0**; so với DDE+ADR+AER +19.0 / +16.5 / +12.9. Mọi CI > 0.
+  - Theo loại: in-distribution 67.3, unseen relation type 69.2, unseen graph type 44.5. Theo số seed: 1 seed 71.2, 4 seed 27.6 (câu nhiều anchor vẫn yếu, như mọi retriever trong paper GTSQA).
+  - Đang chờ REL-RAG và WL.
+- **Chuyển train sang vast (10-11 chiều, theo yêu cầu người dùng: chỉ train trên vast).**
+  - Đã dừng 3 run local: `cwq_rbfnb_s42` (CPU, khoảng 30–45 phút/epoch), `webqsp_rbfnbmm_s42`, `webqsp_rbffix_s42`. Train lại từ đầu trên box #55286305.
+  - Dữ liệu CWQ: `make_global_emb.py` trích một vector cho mỗi tên duy nhất, đúng giá trị trong shard, fp32.
+    - Train: 701,550 entity, 6,468 relation, 2.9 GB. Val: 1.1 GB. Shard gốc là 59 GB.
+    - Lệch lớn nhất giữa các bản lặp của cùng một tên là 6.1e-05. Kiểm 50 câu ngẫu nhiên so với shard: shape bằng nhau, lệch lớn nhất 6.1e-05.
+  - Khác với run CWQ cũ: với bảng gộp, `epoch_order` xáo trộn phẳng thay vì xáo theo nhóm shard. Chỉ thứ tự mẫu khác, dữ liệu và loss giữ nguyên.
+- **Gate WebQSP → GTSQA PASS** (1,622 câu, bootstrap ghép cặp). RBF+nb 57.7 / 64.9 / 71.9:
+  - so với SubgraphRAG (35.4 / 41.2 / 47.9): **+22.3 / +23.7 / +24.0**;
+  - so với REL-RAG repro (path_bf, 38.8 / 46.0 / 50.8): **+18.9 / +18.9 / +21.1**;
+  - so với DDE + ADR + AER: +19.0 / +16.5 / +12.9.
+  - Mọi CI > 0. WL trên GTSQA đang chạy lại; `make_sg_ext` đã sửa cho bản ghi không có `n_text`.
+- **Tách đóng góp: sửa lỗi scatter hay non-backtracking?** `webqsp_rbffix_s42` (không nb, đã sửa lỗi, train trên vast). Một seed:
+
+  | | WebQSP ansR @50/100/200 | CWQ ansR @50/100/200 | CWQ tổ hợp mới |
+  |---|---|---|---|
+  | RBF dính lỗi, không nb | 89.36 / 93.85 / 96.97 | 80.3 / 87.5 / 93.5 | 84.5 |
+  | RBF đã sửa, không nb | 89.42 / 94.26 / 97.41 | 82.1 / 88.7 / 94.0 | 81.5 |
+  | RBF + nb | 89.63 / 93.85 / 97.73 | 81.8 / 89.8 / 94.6 | 84.0 |
+
+  → **Phần lớn lợi ích trước đây gán cho nb thật ra đến từ việc sửa lỗi.** Bản thân nb chỉ lệch từ −0.4 đến +1.1, nằm trong dao động của một seed (seed 0 / 42 lệch nhau tới 1.5).
+  - **ĐÍNH CHÍNH các ghi chú trước:** "nb +0.85 WebQSP / +0.8 CWQ / +8.2 GrailQA" là nb cộng với sửa lỗi, đo trên checkpoint dính lỗi.
+  - Đóng góp chính còn lại là (1) điểm phân rã theo bước và (2) max-marginal của đường đi trọn vẹn (mm). nb giữ lại như một ràng buộc cấu trúc có lý (đã kiểm chính xác) nhưng không được tính là nguồn lợi ích. Đang kiểm trên GrailQA.
+- **nb trên GrailQA tập paper** (bootstrap ghép cặp, cùng seed 42, đều đã sửa lỗi): RBF+nb hơn RBF không nb **+2.9 / +3.9 / +4.3**, mọi CI > 0. Riêng bản không nb đã hơn SubgraphRAG khoảng +15.6 @50.
+  - → **Đóng góp của nb phụ thuộc domain:** trung tính trên WebQSP và CWQ, có ý nghĩa trên các domain mới của GrailQA, nơi có nhiều hub và nút type, đúng với chẩn đoán về đường "nảy". Phần đính chính phía trên được hiểu lại theo kết quả này.
+- **Train với mm (`webqsp_rbfnbmm_s42`, vast) so với chỉ bật mm lúc test:**
+  - WebQSP: 91.46 / 95.44 / 97.86, so với 91.37 / 95.18 / 98.05.
+  - CWQ: 85.2 / 91.2 / 95.5, so với 87.1 / 92.1 / 96.0. Nhóm tổ hợp mới 85.2 so với 85.7.
+  - → Train với mm không đem thêm lợi ích. mm là ràng buộc lúc inference. **Cấu hình chính: train với nb, test với nb + mm.**
+- **WL trên GTSQA** (16 phần): WL 40.9 / 46.0 / 52.8; WL + ADR + AER 48.6 / 56.9 / 64.9.
+  - RBF+nb hơn WL +16.8 / +18.9 / +19.1, hơn WL + ADR + AER +9.1 / +8.1 / +7.0. Mọi CI > 0.
+- **Đính chính ví dụ minh hoạ mm.** Câu "George Clinton → member → [80 CVT] lấp đầy budget" là sai: thực tế có 23 bước member trong top-50, và mm chỉ đưa đáp án từ hạng 57 lên 51. Ví dụ đã đo đúng là "who is the governor of arizona 2009":
+  - Điểm theo tiền tố: cả 50/50 triple đầu là "Arizona → governing_officials → CVT" (−2.64), triple đáp án ở hạng 92 (−3.63).
+  - Với mm: hai bước cùng điểm −3.63, xếp xen kẽ 27 / 23, đáp án lên hạng 5.
+  - Trên toàn WebQSP test, mm sửa 31 câu trượt @50 và làm hỏng 3 câu.
+- **Seed 0 của cấu hình chính** (`webqsp_rbfnb_s0` + mm lúc test):
+  - WebQSP 90.61 / 95.27 / 97.44, gate PASS. Không mm thì seed này FAIL ở @50; mm lấp được.
+  - CWQ 84.4 / 90.4 / 95.5, gate PASS: so với SubgraphRAG +14.3 / +10.8 / +7.8 / +4.2, so với REL-RAG +22.5 @50. Nhóm tổ hợp mới 82.1.
+  - **Trung bình 2 seed:** WebQSP @50 91.0, CWQ @50 85.8.
+- **WebQSP → MetaQA-3hop** (14,118 câu; REL-RAG chỉ có 4,710 câu trong bộ của nó). RBF+nb+mm 42.4 / 57.6 / 70.0:
+  - so với SubgraphRAG (21.5 / 33.7 / 51.8): **+20.9 / +23.8 / +18.2**;
+  - so với WL: +18.7 / +24.5 / +21.6; so với WL + ADR + AER: +21.1 / +25.9 / +22.0;
+  - so với REL-RAG: +27.6 / +42.3 / +55.0. Mọi CI > 0.
+  - **Lưu ý về REL-RAG:** path_bf tự dừng, trung bình chỉ trả **9.6 triple/câu** (trung vị 8), nên recall đứng yên ở 14.4 cho cả ba budget. So ở cùng số triple của từng câu, REL-RAG nhỉnh hơn: 14.4 so với RBF 12.8 (−1.6, CI [−2.1, −1.1]). RBF@10 được 15.3. → Ở budget rất nhỏ, path của REL-RAG chính xác hơn. Ở budget của protocol thì nó không lấp đầy được.
+- **Baseline train trên CWQ cho hàng CWQ → \* của ma trận** (ansR@50/100/200). SubgraphRAG = repro `cwq_dde`; REL-RAG = checkpoint `cwq.pt` của tác giả trong bản repro, path_bf.
+
+  | Tập test | SubgraphRAG (CWQ) | REL-RAG (ckpt CWQ) |
+  |---|---|---|
+  | GrailQA | 41.3 / 50.1 / 58.0 | 37.3 / 44.3 / 52.0 |
+  | GTSQA | 26.1 / 32.1 / 39.8 | 37.2 / 45.1 / 49.8 |
+  | MetaQA | 33.1 / 44.9 / 61.4 | 14.4 / 14.4 / 14.4 (4,710 câu, path tự dừng) |
+
+  - `cwq_rbfnb_s42` (vast) có best mới ở epoch khoảng 30, vẫn đang train.
+- **Hàng CWQ → \* của ma trận** (`cwq_rbfnb_s42`, train trên vast, nb khi train + mm khi test; best ở epoch khoảng 30). Bootstrap ghép cặp; ansR@50/100/200:
+
+  | CWQ → | RBF (CWQ) | so với SubgraphRAG (CWQ) | so với REL-RAG (ckpt CWQ của tác giả) | Gate |
+  |---|---|---|---|---|
+  | CWQ (in-dist) | 90.54 / 94.09 / 96.82 | +4.35 / +2.65 / +1.47 (official) | +9.79 / +8.22 / +7.04 | **PASS**, hơn có ý nghĩa |
+  | WebQSP | 87.23 / 90.90 / 95.01 | +5.02 / +2.75 / +2.09 (repro) | **−3.62 / −4.86 / −2.74** | **FAIL** so với REL-RAG |
+  | GrailQA (paper) | 48.4 / 54.8 / 60.8 | +7.1 / +4.7 / +2.8 (CI @200 chứa 0) | +11.2 / +10.5 / +8.8 | Chưa đạt chặt (@200 hoà) |
+  | GTSQA | 52.4 / 58.4 / 64.8 | +26.2 / +26.3 / +25.0 | +15.1 / +13.3 / +15.0 | **PASS** |
+  | MetaQA | 43.3 / 57.5 / 69.9 | +10.2 / +12.6 / +8.5 | +28.4 / +42.3 / +54.9 (REL-RAG chỉ trả 9.6 triple) | **PASS** |
+
+  → **Điểm yếu thật: CWQ → WebQSP.** Checkpoint CWQ của REL-RAG transfer sang WebQSP rất tốt (90.85, ngang mức train trên WebQSP), trong khi RBF train trên CWQ chỉ được 87.2 (train trên WebQSP: 91.4). Cần phân tích: có thể π học trên CWQ nghiêng về relation ràng buộc/nhiều bước, còn câu WebQSP chủ yếu 1–2 bước, 1 topic.
+
+## EXP-40 — REL-RAG train lại bằng nhãn SPARQL v2, hai setup paper-faithful / code-faithful (10-18)
+- **Nhãn:** `relrag/sparql_to_pathlabels.py webqsp` đi lại chain gold (WebQSP InferentialChain) trên triple của `relrag/data/{train,val}.pkl`, chỉ giữ các trail **kết thúc ở đáp án gold** (giống v2), xuất ra `relrag/data/labels_sparqlv2/{train,val}{,_minlen}.jsonl`. Mỗi path là dãy line-graph node có thứ tự.
+  - Train: 2,511 / 2,798 câu có nhãn, trung bình 5.2 trail/câu. Còn 287 câu không tới được đáp án trong subgraph, `train.py` dùng SP thay thế (206 câu trong 2,710 câu train có nhãn). Val: 215 / 246.
+  - `_minlen`: giữ 1 trail ngắn nhất (code-faithful).
+- **Setup:** giữ nguyên cờ của EXP-16 (`path_paper`) và EXP-17 (`path_codefaithful`), chỉ đổi file nhãn. Train trên 2× T4 (cloudflared), 15 epoch, khoảng 1.5 giờ.
+  - paper-faithful (`runs/path_paper_sparqlv2`): `--labels paths:labels_sparqlv2/train.jsonl --val_labels sp --no_self_loops --batch_size 10 --seed 42` (combine mean, gnn dropout, topic loss all). Chọn checkpoint theo **val loss** như EXP-16, ra **epoch 6** (`epoch_6.pt`). Tham khảo: `best.pt` = epoch 15 chọn theo path_f1.
+  - code-faithful (`runs/path_codefaithful_sparqlv2`): `--labels paths:labels_sparqlv2/train_minlen.jsonl --val_labels paths:labels_sparqlv2/val_minlen.jsonl --no_self_loops --combine sum --gnn_dropout 0 --topic_loss sample --batch_size 4 --seed 1`. Chọn theo path_f1, ra epoch 14.
+- **Kết quả WebQSP test (`infer.py`, metric theo SP; ansR / ansHit):**
+
+| Run | path_bf @50 | @100 | @500 | free (số triple) |
+|---|---|---|---|---|
+| paper, nhãn hybrid (EXP-16, ep 7) | 80.4 / 85.1 | 89.5 / 92.6 | 98.0 / 99.0 | 91.7 / 95.4 (192.7) |
+| **paper, nhãn SPARQL v2 (ep 6, val loss)** | **84.3 / 88.5** | **90.9 / 93.8** | 98.3 / 99.0 | **92.2 / 96.2** (148.2) |
+| *paper, nhãn SPARQL v2 (ep 15, path_f1)* | *88.1 / 91.8* | *93.0 / 95.3* | *98.4 / 99.0* | *90.4 / 94.2 (66.1)* |
+| code-faithful, nhãn hybrid (EXP-17, ep 15) | 90.6 / 94.2 | 94.8 / 96.5 | 98.8 / 99.6 | 90.9 / 94.7 (44.6) |
+| **code-faithful, nhãn SPARQL v2 (ep 14)** | 90.4 / 93.4 | **95.1 / 96.9** | **99.0 / 99.6** | 90.7 / 94.5 (42.3) |
+
+- **Metric theo gold query** (`query_recall.py webqsp`, 1,496 câu, 257 câu có triple ràng buộc; @50 / @100):
+
+| Run | Chain-R | Cons-R | Q-F1 | PathHit | PathAll |
+|---|---|---|---|---|---|
+| SubgraphRAG (official) | 84.8 / 91.0 | 11.5 / 15.4 | 15.6 / 11.4 | 84.1 / 90.1 | 76.6 / 84.0 |
+| paper, hybrid | 76.1 / 84.4 | 24.8 / 38.4 | 16.5 / 12.2 | 79.9 / 87.4 | 68.5 / 77.1 |
+| **paper, SPARQL v2 (ep 6)** | 80.1 / 86.0 | 31.1 / 45.5 | 17.4 / 12.5 | 84.0 / 88.6 | 73.7 / 80.1 |
+| *paper, SPARQL v2 (ep 15)* | *83.7 / 88.7* | *35.5 / 45.9* | *18.5 / 13.2* | *87.2 / 90.8* | *76.9 / 82.4* |
+| code-faithful, hybrid | 85.7 / 89.6 | 32.3 / 43.4 | 18.7 / 13.2 | 88.1 / 91.6 | 77.9 / 83.4 |
+| **code-faithful, SPARQL v2** | **86.7 / 91.1** | 34.5 / 44.2 | **19.2 / 13.6** | **89.6 / 93.6** | **79.4 / 85.0** |
+
+- **Nhận xét:**
+  - **paper-faithful hưởng lợi rõ từ nhãn mới:** cùng tiêu chí chọn checkpoint (val loss), ansR@50 +3.9 (80.4 → 84.3), PathHit@50 +4.1, Cons-R@50 +6.3. Nhãn hybrid dài hơn (d..d+2) và lẫn trail không chứa đáp án; nhãn v2 chỉ giữ trail tới đáp án.
+  - Tiêu chí chọn checkpoint vẫn là yếu tố lớn nhất của paper-faithful: chọn theo path_f1 (ep 15) thêm +3.8 ansR@50 nữa so với val loss (ep 6), như đã thấy ở EXP-16.
+  - **code-faithful gần như không đổi về ansR** (@50 −0.2, @100 +0.3), nhưng tăng nhẹ ở mọi metric theo gold query: PathHit@50 +1.5 / @100 +2.0, PathAll@50 +1.5, Chain-R@50 +1.0, Q-F1 +0.5. Nhãn minlen của hybrid vốn đã gần với chain gold, nên nhãn mới chỉ giúp ít.
+  - Với nhãn v2, code-faithful đạt PathHit@50 89.6, ngang RBF + BGE + WL nhãn SP ∪ rational (90.0, docs/12 §16) và cao hơn SubgraphRAG (84.1).
+  - **Transfer WebQSP → CWQ (2,848 câu, cùng tập với BENCHMARK §6):** nhãn mới làm REL-RAG kém đi. paper-faithful ansR@50 / @100 61.2 / 69.2 → 56.2 / 65.6; code-faithful 61.9 / 72.3 → 57.8 / 67.9; PathHit@50 gần như không đổi (38.2 → 37.7, 38.4 → 37.3). Nhãn SPARQL của WebQSP gần như toàn chain 1 hop, decoder học đi ngắn hơn. Cùng nhãn này lại giúp RBF + BGE + WL (87.9 → 90.3).
+  - Bảng thống nhất của cả phase: BENCHMARK.md §6 (`relrag/sparql_phase_table.py`). QA chưa chạy (cần server bf16).
+- **Artifact:** `relrag/runs/path_{paper,codefaithful}_sparqlv2/` (`args.json`, `log.json`, `best.pt`, `epoch_6.pt` cho paper, `retrieval_test_path_{bf,free}{,_ep6}/`, `retrieval_cwq_test_path_bf{,_ep6}/`). Checkpoint từng epoch còn lại chỉ có trên server.
+
+## EXP-41 — BGE-M3 LoRA tuning lại bằng nhãn SPARQL v2; RT_combined + WL dùng BGE đó (10-20)
+- **BGE:** recipe Phase 11 `v1_dense_entity_disjoint` giữ nguyên (LoRA r 8, 3 epoch, lr 1e-4, chỉ WebQSP train, split entity-disjoint). Chỉ đổi tập relation dương: câu có nhãn v2 lấy relation của chain + constraint (`retrieve/exp_qrdde/bge_sparql_data.py`), câu không có nhãn v2 giữ SP. 2,605 / 2,848 câu dùng nhãn v2; trung bình 1.8 relation dương/câu (SP: 5.0). Train trên Kaggle T4 (`vast/bge_sparql_remote.sh`, transformers 4.57, gradient checkpointing non-reentrant). Dev: recall@10 0.837, MRR 0.78. Adapter + điểm: `data/bge_p11/{adapter_sparql2,scores_ft_sparql2}`.
+- **Độ phủ relation của gold query trên test** (đủ cả chain trong top-5 / top-10; recall@10 chain + constraint):
+
+  | | base | tuned SP (cũ) | tuned SPARQL v2 |
+  |---|---|---|---|
+  | WebQSP (1,496 câu) | 55.8 / 68.6; 72.7 | 74.1 / 84.2; 86.1 | **76.4 / 89.2; 89.4** |
+  | CWQ (2,510 câu) | 24.3 / 40.4; 55.8 | 33.8 / 50.4; 66.1 | **39.0 / 56.1; 68.8** |
+
+- **RT_combined + WL** (qrdde `dde+rt` + `effective_num`, nhãn SPARQL v2, seed 42, patience 10; cờ mới `--rt_src bge --rel_prior bge2`: nửa ngữ nghĩa của điểm relation lấy từ BGE mới, embedding vẫn GTE, nửa lexical là lexical của WL). Đối chứng cùng nhãn với điểm relation GTE. Bảng thống nhất BENCHMARK §6 (`relrag/sparql_phase_table.py`), ansR@50/100, PathHit@50, Cons-R@50:
+
+  | Retriever · nhãn | WebQSP (ID) | WebQSP → CWQ |
+  |---|---|---|
+  | RT_combined + WL (GTE) · SP (`webqsp_wlq_s42`) | 91.9 / 95.1; 87.4; 11.7 | 73.9 / 83.7; 46.8; 31.1 |
+  | RT_combined + WL (GTE) · SPARQL v2 | **94.8 / 97.3**; 94.3; **68.9** | 79.1 / 86.9; 51.8; 19.4 |
+  | RT_combined + WL (BGE SPARQL v2) · SPARQL v2 | 94.1 / 96.8; **95.4**; 67.6 | 79.1 / 86.7; 52.5; 20.5 |
+  | RBF_nb_mm · SPARQL v2 | 92.8 / 96.4; 92.4; 59.3 | 87.5 / 92.7; 66.1; 39.8 |
+  | RBF + BGE (cũ) + WL · SPARQL v2 | 93.5 / 97.0; 93.6; 65.8 | **90.3 / 94.6**; 64.0; 51.3 |
+
+- **Kết luận:**
+  - Nhãn SPARQL là thứ làm WL tăng (+2.9 ansR@50 ID, +5.2 transfer); thay GTE bằng BGE tuned SPARQL trong kênh RT **không thêm gì** (−0.7 / 0.0 ansR@50, +1.1 PathHit@50 ID). MLP trên entity + DDE quyết định thứ hạng, điểm relation chỉ là một feature phụ.
+  - WL + SPARQL v2 là retriever ID mạnh nhất hiện có (94.8), nhưng transfer kém RBF 8–11 điểm ansR@50: phần entity-aware không tổng quát hoá sang tổ hợp mới. RBF ngược lại. Đây là căn cứ cho hướng thêm nhân tử entity / constraint ở bước cuối của RBF (chưa chạy).
+- **Artifact:** `retrieve/exp_qrdde/runs/webqsp_wl_{gte,bge2}_sparql2_s42/` (`best.pt`, `result.json`, `adr_{webqsp,cwq}_base_mm1_full.pth`).
+- **Cập nhật 10-20 (trưa): AER / ADR trên hai checkpoint WL SPARQL v2** (`adr_probe.py`, B = 3, không train lại; chạy trên GPU 1080 Ti local, ~7 phút / tập CWQ). Cùng tập câu với BENCHMARK §6; ansR@50 / @100, PathHit@50, Cons-R@50:
+
+  | Checkpoint · mode | WebQSP (ID) | WebQSP → CWQ (OOD) |
+  |---|---|---|
+  | WL (GTE) · base | 94.8 / 97.3; 94.3; 68.9 | 79.1 / 86.9; 51.8; 19.4 |
+  | WL (GTE) · AER | 94.6 / 97.0; 93.9; 69.1 | 86.3 / 92.7; 53.7; 22.6 |
+  | WL (GTE) · ADR | 94.8 / 97.3; 94.1; 69.4 | 80.6 / 87.9; 52.2; 28.7 |
+  | WL (GTE) · ADR + AER | 94.6 / 97.0; 93.6; 70.6 | **87.4 / 93.5**; 53.7; 34.4 |
+  | WL (BGE SPARQL v2) · base | 94.1 / 96.8; 95.4; 67.6 | 79.1 / 86.7; 52.5; 20.5 |
+  | WL (BGE SPARQL v2) · ADR + AER | 93.8 / 96.6; 95.1; 70.4 | 87.1 / 92.4; 52.9; 34.4 |
+  | RBF_nb_mm · SPARQL v2 | 92.8 / 96.4; 92.4; 59.3 | 87.5 / 92.7; **66.1**; 39.8 |
+  | RBF + BGE + WL · SPARQL v2 | 93.5 / 97.0; 93.6; 65.8 | **90.3 / 94.6**; 64.0; **51.3** |
+
+  - AER gánh gần hết phần tăng OOD (+7.2 ansR@50), ADR riêng +1.5, cộng lại +8.3 (79.1 → 87.4): ngang RBF_nb_mm v2, vẫn kém RBF + BGE + WL 2.9. ID gần như không đổi (−0.2 / −0.3).
+  - **PathHit@50 OOD không nhích** (~53 ở mọi mode, RBF 64–66): bridge của AER đưa đáp án vào top-50 nhưng không đưa được đường đi gold từ topic. Cons-R tăng (19 → 34) nhưng còn dưới RBF + BGE + WL (51).
+  - Chi phí: ~6.5 lượt mô hình / câu nhiều topic (RBF: 1 lượt). Profile GPU: một lượt WL ~55 ms, chủ yếu là `nonzero` / `index` trong DDE (đồng bộ host), không phải MLP. `adr_probe.py` giờ dùng chung cache lượt giữa các mode của cùng một câu (kết quả y hệt, nhanh gấp đôi).

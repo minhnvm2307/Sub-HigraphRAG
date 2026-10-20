@@ -39,6 +39,9 @@ def ollama_chat(messages, model="llama3.1", max_tokens=4000, temperature=0, base
     return res_json
 
 
+OPENROUTER_SPENT = [0.0, 0]          # [USD spent, requests] in this process (openrouter backend)
+
+
 def llm_init(model_name, tensor_parallel_size=1, max_seq_len_to_capture=8192, max_tokens=4000, seed=0, temperature=0, frequency_penalty=0, ollama_base_url=None):
     if not ollama_base_url:
         ollama_base_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
@@ -56,6 +59,42 @@ def llm_init(model_name, tensor_parallel_size=1, max_seq_len_to_capture=8192, ma
         hf_id = model_name.split(":", 1)[1] if ":" in model_name else "meta-llama/Llama-3.1-8B-Instruct"
         llm = partial(client.chat.completions.create, model=hf_id, seed=seed, temperature=temperature, max_tokens=max_tokens,
                       frequency_penalty=frequency_penalty)
+    elif model_name.startswith("openrouter"):
+        # OpenRouter (10-12): -m openrouter:<model>, default meta-llama/llama-3.1-8b-instruct, provider pinned to DeepInfra
+        # fp8 without fallback (as rapl_faithful/generate_answers_openrouter.py), usage cost read per request; a hard budget
+        # OPENROUTER_BUDGET (USD) stops the run (raises) before it is exceeded. Key: OPENROUTER_API_KEY (.env, never printed)
+        client = OpenAI(api_key=os.getenv("OPENROUTER_API_KEY"), base_url="https://openrouter.ai/api/v1", timeout=300, max_retries=4)
+        or_id = model_name.split(":", 1)[1] if ":" in model_name else "meta-llama/llama-3.1-8b-instruct"
+        extra = {"provider": {"order": [os.getenv("OPENROUTER_PROVIDER", "DeepInfra")], "allow_fallbacks": False,
+                              "quantizations": [os.getenv("OPENROUTER_QUANT", "fp8")]}, "usage": {"include": True}}
+        base = partial(client.chat.completions.create, model=or_id, seed=seed, temperature=temperature, max_tokens=max_tokens,
+                       frequency_penalty=frequency_penalty, extra_body=extra)
+
+        def llm(**kw):
+            if OPENROUTER_SPENT[0] >= float(os.getenv("OPENROUTER_BUDGET", "0.05")):
+                raise RuntimeError(f"OpenRouter budget reached: ${OPENROUTER_SPENT[0]:.4f}")
+            out = base(**kw)
+            u = getattr(out, 'usage', None)
+            OPENROUTER_SPENT[0] += float(getattr(u, 'cost', 0) or (u.model_extra or {}).get('cost', 0) if u is not None else 0)
+            OPENROUTER_SPENT[1] += 1
+            return out
+    elif model_name.startswith("deepinfra"):
+        # DeepInfra direct (10-13): -m deepinfra[:<model>], default Meta-Llama-3.1-8B-Instruct-Turbo, the fp8 deployment
+        # the openrouter backend was pinned to. Cost from usage.estimated_cost; hard budget DEEPINFRA_BUDGET (USD).
+        # Key: DEEP_INFRA_KEY (.env, never printed)
+        client = OpenAI(api_key=os.getenv("DEEP_INFRA_KEY"), base_url="https://api.deepinfra.com/v1/openai", timeout=300, max_retries=4)
+        di_id = model_name.split(":", 1)[1] if ":" in model_name else "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
+        base = partial(client.chat.completions.create, model=di_id, seed=seed, temperature=temperature, max_tokens=max_tokens,
+                       frequency_penalty=frequency_penalty)
+
+        def llm(**kw):
+            if OPENROUTER_SPENT[0] >= float(os.getenv("DEEPINFRA_BUDGET", "0.05")):
+                raise RuntimeError(f"DeepInfra budget reached: ${OPENROUTER_SPENT[0]:.4f}")
+            out = base(**kw)
+            u = getattr(out, 'usage', None)
+            OPENROUTER_SPENT[0] += float((u.model_extra or {}).get('estimated_cost', 0) or 0) if u is not None else 0
+            OPENROUTER_SPENT[1] += 1
+            return out
     elif "ollama:qwen" in model_name:
         # Ollama models via OpenAI-compatible API
         client = OpenAI(api_key="ollama", base_url=ollama_base_url)
@@ -68,7 +107,7 @@ def llm_init(model_name, tensor_parallel_size=1, max_seq_len_to_capture=8192, ma
 def get_outputs(outputs, model_name):
     if "ollama:llama" in model_name:
         return outputs["message"]["content"]
-    elif "fpt" in model_name or "ollama" in model_name or model_name.startswith("vllm"):
+    elif "fpt" in model_name or "ollama" in model_name or model_name.startswith("vllm") or model_name.startswith("openrouter") or model_name.startswith("deepinfra"):
         return outputs.choices[0].message.content
     else:
         return outputs[0].outputs[0].text

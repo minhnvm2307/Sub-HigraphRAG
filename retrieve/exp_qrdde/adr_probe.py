@@ -20,7 +20,7 @@ import argparse, os
 import numpy as np
 import torch
 import torch.nn.functional as F
-from qrdde import Scorer, build_scorer, resolve, to_device, with_anchors, bridges
+from qrdde import Scorer, build_scorer, resolve, to_device, with_anchors, bridges, attach_rel_prior
 import json
 from tqdm import tqdm
 
@@ -29,10 +29,13 @@ z = lambda v: (v - v.mean()) / (v.std() + 1e-6)
 
 
 @torch.no_grad()
-def fuse(m, rec, emb, dev, md, B=3):
-    """fused triple scores of one question for mode md (see module docstring)"""
-    cache = {}
-    x0 = to_device(rec, emb, dev, need_lex=hasattr(m, 'rt_dde'))   # once per question; passes differ only in anchors
+def fuse(m, rec, emb, dev, md, B=3, memo=None):
+    """fused triple scores of one question for mode md (see module docstring). memo: a dict shared by the modes of one
+    question, so that each anchor set is scored once across modes (the passes are identical)"""
+    memo = {} if memo is None else memo
+    if 'x0' not in memo:      # once per question; passes differ only in anchors
+        memo['x0'] = to_device(rec, emb, dev, need_lex=hasattr(m, 'rt_dde') or hasattr(m, 'rbf'))
+    cache, x0 = memo.setdefault('passes', {}), memo['x0']
     def S(anchors):
         key = tuple(sorted(anchors))
         if key not in cache:
@@ -74,27 +77,46 @@ def main():
     ap.add_argument('--modes', default='base,aer,adr,adr_aer')
     ap.add_argument('--B', type=int, default=3)
     ap.add_argument('--topk', type=int, default=500)
+    ap.add_argument('--device', default='cuda:0')
+    ap.add_argument('--rbf_T', type=int, default=0, help='RBF-Ret: propagation steps at test time (0 = as trained); '
+                    'exports get the suffix _T<k>')
+    ap.add_argument('--rbf_nb', type=int, default=-1, help='RBF-Ret: force non-backtracking walks on (1) / off (0) at test '
+                    'time; exports get the suffix _nb<k>')
+    ap.add_argument('--rbf_mm', type=int, default=-1, help='RBF-Ret: complete-path max-marginal on (1) / off (0) at test '
+                    'time; exports get the suffix _mm<k>')
+    ap.add_argument('--tag', default='', help='suffix of the export names')
     args = ap.parse_args()
-    dev = torch.device('cuda:0')
+    dev = torch.device(args.device)
     a = json.load(open(f'{ROOT}/runs/{args.run}/result.json'))['args']
     
     model = build_scorer(a).to(dev)
     model.load_state_dict(torch.load(f'{ROOT}/runs/{args.run}/best.pt', map_location=dev))
     model.eval()
+    if args.rbf_nb >= 0:
+        model.rbf.nb = bool(args.rbf_nb); args.tag += f'_nb{args.rbf_nb}'
+    if args.rbf_mm >= 0:
+        model.rbf.mm = bool(args.rbf_mm); args.tag += f'_mm{args.rbf_mm}'
+    if args.rbf_T:
+        model.rbf.T = args.rbf_T; args.tag += f'_T{args.rbf_T}'
     recs, emb = resolve(args.dataset, 'test', True)
+    if a.get('rel_prior', 'none') != 'none':
+        if a['rel_prior'] == 'pmh':                   # in-distribution only: the cache's memory uses that dataset's labels
+            assert args.dataset == a['dataset'], 'Path+Memory prior is valid in-distribution only'
+        attach_rel_prior(recs, args.dataset, 'test', a['rel_prior'], a['dataset'])
     modes = args.modes.split(',')
     out = {md: {} for md in modes}
 
     with torch.no_grad():
         for rec in tqdm(recs, desc="Inference retrieval"):
+            memo = {}
             for md in modes:
-                sc = fuse(model, rec, emb, dev, md, args.B)
+                sc = fuse(model, rec, emb, dev, md, args.B, memo)
                 top = torch.topk(sc, min(args.topk, len(sc))).indices.cpu().numpy(); scn = sc.cpu().numpy()
                 N, L = rec['entity_names'], rec['relation_list']
                 out[md][rec['id']] = {'question': rec['question'], 'scored_triples': [
                     (N[rec['h'][i]], L[rec['r'][i]], N[rec['t'][i]], float(scn[i])) for i in top]}
     for md in modes:
-        torch.save(out[md], f'{ROOT}/runs/{args.run}/adr_{args.dataset}_{md}.pth')
+        torch.save(out[md], f'{ROOT}/runs/{args.run}/adr_{args.dataset}_{md}{args.tag}.pth')
 
 
 if __name__ == '__main__':

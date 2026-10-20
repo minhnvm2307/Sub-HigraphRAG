@@ -7,17 +7,31 @@ def main(args):
     gpt_triple_dict = torch.load(f'data_files/{args.dataset}/gpt_triples.pth')
     k_list = [int(k) for k in args.k_list.split(',')]
     
+    # Check if pred_dict already contains shortest-path ground truth
+    has_target = any('target_relevant_triples' in pred_dict[s] and len(pred_dict[s]['target_relevant_triples']) > 0 for s in pred_dict)
+    gt_sp_dict = {}
+    if not has_target:
+        import pickle
+        print(f"[eval] 'target_relevant_triples' not found in file. Loading ground truth on-the-fly from {args.dataset}...")
+        raw = pickle.load(open(f'data_files/{args.dataset}/processed/test.pkl', 'rb'))
+        ts = torch.load(f'data_files/{args.dataset}/triple_scores/test.pth', map_location='cpu', weights_only=False)
+        for s in raw:
+            sid = s['id']
+            if sid in ts and 'triple_scores' in ts[sid]:
+                pos_idx = ts[sid]['triple_scores'].nonzero().reshape(-1).tolist()
+                names = s['text_entity_list'] + s['non_text_entity_list']
+                rels = s['relation_list']
+                gt_sp_dict[sid] = set((names[s['h_id_list'][i]], rels[s['r_id_list'][i]], names[s['t_id_list'][i]]) for i in pos_idx)
+            else:
+                gt_sp_dict[sid] = set()
+        del raw, ts
+
     metric_dict = dict()
     for k in k_list:
         # Recall metrics
         metric_dict[f'ans_recall@{k}'] = []
         metric_dict[f'shortest_path_triple_recall@{k}'] = []
         metric_dict[f'gpt_triple_recall@{k}'] = []
-
-        # Precision metrics
-        metric_dict[f'ans_precision@{k}'] = []
-        metric_dict[f'shortest_path_triple_precision@{k}'] = []
-        metric_dict[f'gpt_triple_precision@{k}'] = []
     
     for sample_id in pred_dict:
         if len(pred_dict[sample_id]['scored_triples']) == 0:
@@ -32,19 +46,15 @@ def main(args):
                 metric_dict[f'ans_recall@{k}'].append(
                     len(a_entity_in_graph & entities_k) / len(a_entity_in_graph)
                 )
-                metric_dict[f'ans_precision@{k}'].append(
-                    len(a_entity_in_graph & entities_k) / len(entities_k) if len(entities_k) > 0 else 0.0
-                )
         triples = list(zip(h_list, r_list, t_list))
-        shortest_path_triples = set(pred_dict[sample_id]['target_relevant_triples'])
+        shortest_path_triples = set(pred_dict[sample_id].get('target_relevant_triples', []))
+        if len(shortest_path_triples) == 0 and not has_target:
+            shortest_path_triples = gt_sp_dict.get(sample_id, set())
         if len(shortest_path_triples) > 0:
             for k in k_list:
                 triples_k = set(triples[:k])
                 metric_dict[f'shortest_path_triple_recall@{k}'].append(
                     len(shortest_path_triples & triples_k) / len(shortest_path_triples)
-                )
-                metric_dict[f'shortest_path_triple_precision@{k}'].append(
-                    len(shortest_path_triples & triples_k) / len(triples_k) if len(triples_k) > 0 else 0.0
                 )
         gpt_triples = set(gpt_triple_dict.get(sample_id, []))
         if len(gpt_triples) > 0:
@@ -52,9 +62,6 @@ def main(args):
                 triples_k = set(triples[:k])
                 metric_dict[f'gpt_triple_recall@{k}'].append(
                     len(gpt_triples & triples_k) / len(gpt_triples)
-                )
-                metric_dict[f'gpt_triple_precision@{k}'].append(
-                    len(gpt_triples & triples_k) / len(triples_k) if len(triples_k) > 0 else 0.0
                 )
 
     for metric, val in metric_dict.items():
@@ -70,15 +77,6 @@ def main(args):
         ],
         'gpt_triple_recall': [
             round(metric_dict[f'gpt_triple_recall@{k}'], 3) for k in k_list
-        ],
-        'ans_precision': [
-            round(metric_dict[f'ans_precision@{k}'], 3) for k in k_list
-        ],
-        'shortest_path_triple_precision': [
-            round(metric_dict[f'shortest_path_triple_precision@{k}'], 3) for k in k_list
-        ],
-        'gpt_triple_precision': [
-            round(metric_dict[f'gpt_triple_precision@{k}'], 3) for k in k_list
         ]
 
     }

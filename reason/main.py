@@ -216,6 +216,8 @@ def main():
                         try:
                             return llm_inf_all(llm, qa, llm_mode, model_name)
                         except Exception as e:
+                            if 'budget reached' in str(e):
+                                raise  # stop the run (resumable) instead of writing empty answers past the budget
                             print(f"[{qa['id']}] attempt {attempt + 1} failed: {e!r}")
                     return ["", ""]
                 window = deque()

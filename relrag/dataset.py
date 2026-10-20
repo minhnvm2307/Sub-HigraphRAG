@@ -4,17 +4,16 @@ Node i of the line graph is triple (h_i, r_i, t_i); a directed edge i -> j exist
 (paper Def. 4). Node features follow the original RAPL code: [h_emb | r_emb | t_emb] (3072-d),
 with zero vectors for non-text (CVT) entities. The full line graph is used (no edge cap).
 """
-import json, random, pickle
+import json, os, random, pickle
 import numpy as np
 import scipy.sparse as sp
 import torch
 import torch.nn.functional as F
 
-DATA_DIR = '/home/minhnv/Lab/SubgraphRAG/relrag/data'
-EMB_DIR = '/home/minhnv/Lab/SubgraphRAG/retrieve/data_files/webqsp/emb/gte-large-en-v1.5'
-
-
-MEMMAP_DIR = '/home/minhnv/Lab/SubgraphRAG/relrag/data/emb_memmap'
+ROOT = os.environ.get('RELRAG_ROOT', '/home/minhnv/Lab/SubgraphRAG')
+DATA_DIR = f'{ROOT}/relrag/data'
+EMB_DIR = f'{ROOT}/retrieve/data_files/webqsp/emb/gte-large-en-v1.5'
+MEMMAP_DIR = f'{DATA_DIR}/emb_memmap'
 
 
 class MemmapEmbeddings:
@@ -57,7 +56,7 @@ class ExtEmbeddings:
 
 
 def load_embeddings(split, dataset='webqsp'):
-    if dataset in ('gtsqa', 'metaqa3', 'grailqa', 'grailqa_oda'):
+    if dataset in ('gtsqa', 'metaqa3', 'grailqa', 'grailqa_oda', 'grailqa_paper'):
         return ExtEmbeddings(dataset)
     return MemmapEmbeddings(split, dataset)
 

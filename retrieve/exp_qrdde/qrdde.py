@@ -47,8 +47,57 @@ sys.path.insert(0, ROOT)
 from src.model.retriever import DDE
 from src.dataset.retriever import ShardedEmbDict, compute_lexical_score, clean_text
 from src.setup import set_seed
+from rbf import RBF, log_to_logit, NEG as NEG_RBF
 
 K_LIST = [20, 50, 100, 200]
+REL_PRIOR_DIM = {'none': 0, 'pmh': 2, 'mem': 2, 'bge': 2, 'bge2': 2}
+
+
+def answer_softmax_loss(o, x):
+    """listwise answer loss on the RBF best-path scores (node_logp [A, n], log space): per anchor,
+    -log( sum_{v in answers} exp F_a(v) / sum_{v text, v not an anchor} exp F_a(v) ); anchors that reach no answer within
+    T steps are skipped (no gradient through unreachable answers). Trains pi to rank the answers' best paths above every
+    other entity's, which is what a top-k budget needs (BCE on triples is dominated by easy negatives)."""
+    lp, ans = o['node_logp'], x['a_ent']
+    if len(ans) == 0:
+        return lp.sum() * 0
+    n_text = len(x['ent']); anchors = x['topic'][:, 1].nonzero().reshape(-1)
+    cand = torch.ones(lp.shape[1], dtype=torch.bool, device=lp.device); cand[n_text:] = False; cand[anchors] = False
+    ans = ans[cand[ans]]
+    if len(ans) == 0:
+        return lp.sum() * 0
+    pos, den = lp[:, ans], lp[:, cand]
+    ok = pos.max(1).values > NEG_RBF / 2
+    if not ok.any():
+        return lp.sum() * 0
+    return (torch.logsumexp(den[ok], 1) - torch.logsumexp(pos[ok], 1)).mean()
+
+
+def attach_rel_prior(recs, dataset, split, kind, source=None):
+    """per-relation prior columns on each record (rec['rel_prior'], [n_rel, d]); 'pmh' = the Path+Memory Hybrid relation
+    selector of the SubgraphRAG work (retrieve/data_files/<ds>/relation_topics/path_memory_hybrid/<split>.pth: col 0 =
+    fused path score in [0, 1], col 1 = selected-relation mask). Its memory uses the SAME dataset's training labels, so
+    it is valid in-distribution only. Missing questions get zeros."""
+    if kind == 'none':
+        return recs
+    if kind == 'mem':        # make_memory_prior.py: votes of the SOURCE (= training) dataset's train questions; valid on transfer
+        cache = pickle.load(open(f'{ROOT}/exp_qrdde/data/{dataset}/memprior_{source}_{split}.pkl', 'rb'))
+        cache = {k: torch.from_numpy(v) for k, v in cache.items()}
+    elif kind in ('bge', 'bge2'):   # relscore_bge.py: Phase 11 BGE-M3 LoRA relation encoder retrained on WebQSP train only
+        # ('bge2': positives from SPARQL v2 labels, bge_sparql_data.py); columns [cos(q, r), cos - max cos of the question]
+        sub = {'bge': 'scores_ft', 'bge2': 'scores_ft_sparql2'}[kind]
+        raw = pickle.load(open(f'{ROOT}/exp_qrdde/data/bge_p11/{sub}/{dataset}_{split}.pkl', 'rb'))
+        cache = {k: torch.from_numpy(np.stack([v, v - v.max()], 1)) for k, v in raw.items()}
+    else:
+        cache = torch.load(f'{ROOT}/data_files/{dataset}/relation_topics/path_memory_hybrid/{split}.pth', weights_only=False)
+    miss = 0
+    for rec in recs:
+        c = cache.get(str(rec['id']))
+        if c is None or c.shape[0] != len(rec['relation_list']):
+            c = torch.zeros((len(rec['relation_list']), 2)); miss += 1
+        rec['rel_prior'] = c.float().numpy()
+    print(f'[rel_prior {kind}] {dataset} {split}: {len(recs)} records, {miss} without a cache entry', flush=True)
+    return recs
 
 
 class SubsetEmb:
@@ -77,6 +126,20 @@ class ShardEmbAdapter:
         return self.src._index.get(str(sid), '')
 
 
+class LeanEmb:
+    """Relation-only embeddings for RBF-Ret training (make_lean_emb.py): RBF reads the question and relation vectors and
+    only the NUMBER of text entities (len(x['ent'])), so the per-question entity matrix (n_ent x 1024, the bulk of every
+    epoch's IO and host->device copies) is replaced by an empty (n_text, 0) tensor. Same .get contract as SubsetEmb.
+    Whole tables are held in RAM (CWQ train: ~0.15 GB instead of ~4 GB of entity vectors)."""
+    def __init__(self, d):
+        self.index = pickle.load(open(f'{d}/index.pkl', 'rb'))                 # sid -> (q row, rel_table ids, n_text)
+        self.q, self.rel = np.load(f'{d}/q.npy'), np.load(f'{d}/rel_table.npy')
+
+    def get(self, sid):
+        k, ri, nt = self.index[sid]
+        return torch.from_numpy(self.q[k:k + 1]), torch.empty((nt, 0)), torch.from_numpy(self.rel[ri])
+
+
 def load(dataset, split, data_dir=None, emb_dir=None, shard_index=None, max_cache_shards=4):
     """data_dir: base dir holding <split>.pkl (default exp_qrdde/data/<dataset>, the 800/1500-q
     subset). emb_dir: embedding source dir; defaults to <data_dir>/emb_<split> (subset layout).
@@ -91,7 +154,24 @@ def load(dataset, split, data_dir=None, emb_dir=None, shard_index=None, max_cach
     return recs, emb
 
 
-def resolve(dataset, split, full, max_cache_shards=4):
+def apply_sparql_labels(recs, dataset, split, with_constraints=True, version=''):
+    """Replace the SP labels by the gold-query labels (label_compare.py -> data/<ds>/sparql_<split>.pkl: triples of the
+    gold chain walked inside the subgraph, plus the bound constraint triples). Questions without a bound chain keep SP.
+    Applied to train AND val, so the model-selection metric (val triple_recall@100) follows the same target."""
+    # version 'v2' (make_sparql_v2.py -> sparqlv2_<split>.pkl): only the gold-chain trails that END AT A GOLD ANSWER, and their constraints
+    # version 'v3' (make_sparql_v3.py): v2 + hops walked in reverse when needed + chain-anchored shortest bridges to the answer
+    lab = pickle.load(open(f'{ROOT}/exp_qrdde/data/{dataset}/sparql{version}_{split}.pkl', 'rb'))
+    n = 0
+    for rec in recs:
+        q = lab.get(rec['id'])
+        if q and q['chain']:
+            new = np.zeros_like(rec['label']); new[q['chain'] + (q['cons'] if with_constraints else [])] = 1
+            rec['label'] = new; n += 1
+    print(f'[labels sparql{version}{"" if with_constraints else "_chain"}] {dataset} {split}: {n}/{len(recs)} records relabelled, '
+          f'{len(recs) - n} keep SP', flush=True)
+
+
+def resolve(dataset, split, full, max_cache_shards=4, lean=False):
     """Full-data embedding wiring for --full (see docs/01_RESEARCH_PLAN.md M2): WebQSP always
     reuses /relrag/data/emb_memmap/<split> (id-for-id identical to the SubsetEmb/make_memmap.py
     layout, verified: 1639/1639 ids match on webqsp test); CWQ test reuses
@@ -100,6 +180,15 @@ def resolve(dataset, split, full, max_cache_shards=4):
     if not full:
         return load(dataset, split)
     data_dir = f'{ROOT}/exp_qrdde/data/{dataset}'
+    if lean:                                                         # RBF training: make_lean_emb.py tables + lex
+        d = f'{data_dir}/lemb_{split}'
+        recs = pickle.load(open(f'{data_dir}/{split}.pkl', 'rb')); lex = pickle.load(open(f'{d}/lex.pkl', 'rb'))
+        for rec in recs:
+            rec['lex'] = lex[rec['id']]
+        return recs, LeanEmb(d)
+    if os.path.exists(f'{data_dir}/gemb_{split}/index.pkl'):       # compact unique-entity copy (make_global_emb.py)
+        from ext_data import GlobalEmb
+        return pickle.load(open(f'{data_dir}/{split}.pkl', 'rb')), GlobalEmb.from_dir(f'{data_dir}/gemb_{split}')
     if dataset == 'webqsp':
         return load(dataset, split, data_dir=data_dir, emb_dir=f'{RELRAG}/data/emb_memmap/{split}')
     if split == 'test':
@@ -143,7 +232,9 @@ def to_device(rec, emb, dev, need_lex=True):
     return {'lex': torch.from_numpy(lexical(rec)).to(dev) if need_lex else None, 'h': torch.from_numpy(rec['h'].astype(np.int64)).to(dev), 'r': torch.from_numpy(rec['r'].astype(np.int64)).to(dev),
             't': torch.from_numpy(rec['t'].astype(np.int64)).to(dev), 'q': q.float().to(dev), 'ent': ent.float().to(dev),
             'rel': rel.float().to(dev), 'topic': F.one_hot(topic, 2).float().to(dev),
-            'label': torch.from_numpy(rec['label'].astype(np.float32)).to(dev), 'n_ent': rec['n_ent']}
+            'label': torch.from_numpy(rec['label'].astype(np.float32)).to(dev), 'n_ent': rec['n_ent'],
+            'rel_prior': torch.from_numpy(rec['rel_prior']).to(dev) if 'rel_prior' in rec else None,
+            'a_ent': torch.tensor(rec.get('a_ent', []), dtype=torch.long, device=dev)}
 
 
 class QRDDE(nn.Module):
@@ -172,13 +263,23 @@ class QRDDE(nn.Module):
 
 
 class Scorer(nn.Module):
-    def __init__(self, feat, emb=1024, d=64, K=3, rtdde_floor=0.1, dde_rounds=2, hidden=None, layers=2):
+    def __init__(self, feat, emb=1024, d=64, K=3, rtdde_floor=0.1, dde_rounds=2, hidden=None, layers=2, rbf_T=3, rbf_prior=True, rbf_pi='mlp', rbf_node=False, rbf_nb=False, rbf_mm=False, rel_prior='none', rt_src='gte'):
         """dde_rounds: forward = reverse DDE rounds (SubgraphRAG: 2). hidden / layers: MLP width (default = emb, as in
         SubgraphRAG) and depth (2 = Linear-ReLU-Linear, as in SubgraphRAG). Defaults reproduce the original module tree,
         so old checkpoints load unchanged."""
         super().__init__()
-        self.feat = feat
+        self.feat, self.rt_src = feat, rt_src
         tokens = feat.split('+')
+        if 'rbfonly' in tokens:          # RBF-Ret alone (rbf.py): no SubgraphRAG MLP, the path score is the logit
+            self.rbf = RBF(emb, T=rbf_T, prior=rbf_prior, pi=rbf_pi, node=rbf_node, nb=rbf_nb, mm=rbf_mm, extra_prior=REL_PRIOR_DIM[rel_prior]); return
+        if 'rbfpoe' in tokens:
+            # product of experts: P(evidence) = P(on a reliable path from an anchor; RBF) x P(locally relevant; MLP on the
+            # triple's text only: q, z_h, z_r, z_t -- no anchor flags, no DDE, no path features, so it cannot encode a
+            # composition); trained jointly with one BCE on the product
+            self.rbf = RBF(emb, T=rbf_T, prior=rbf_prior, pi=rbf_pi, node=rbf_node, nb=rbf_nb, mm=rbf_mm, extra_prior=REL_PRIOR_DIM[rel_prior])
+            self.non_text = nn.Embedding(1, emb)
+            hidden = hidden or emb
+            self.loc = nn.Sequential(nn.Linear(4 * emb, hidden), nn.ReLU(), nn.Linear(hidden, 1)); return
         self.non_text = nn.Embedding(1, emb)
         ent_dim = emb + 2
         if 'dde' in tokens:
@@ -196,6 +297,10 @@ class Scorer(nn.Module):
         if 'qrdde' in tokens or 'qrdde_noq' in tokens:
             self.qr = QRDDE(emb, d, K, use_query=('qrdde_noq' not in tokens)); ent_dim += d
         trip_extra = 0
+        if 'rbf' in tokens:
+            # RBF-Ret (rbf.py) path scores as 4 extra triple features of the SubgraphRAG MLP (+ auxiliary BCE on the
+            # path score, --rbf_aux)
+            self.rbf = RBF(emb, T=rbf_T, prior=rbf_prior, pi=rbf_pi, node=rbf_node, nb=rbf_nb, mm=rbf_mm, extra_prior=REL_PRIOR_DIM[rel_prior]); trip_extra += 4
         if 'rt' in tokens:
             self.rt_dde = DDE(num_rounds=dde_rounds, num_reverse_rounds=dde_rounds); ent_dim += 2 * 2 * dde_rounds
             trip_extra += 2
@@ -206,6 +311,18 @@ class Scorer(nn.Module):
         self.pred = nn.Sequential(*mlp, nn.Linear(hidden, 1))
 
     def forward(self, x):
+        if 'rbfpoe' in self.feat.split('+'):
+            o = self.rbf(x)
+            path_lp = o['final'] - 0.6931471805599453                       # log P(path); = union for one anchor
+            nt = self.non_text.weight.expand(x['n_ent'] - len(x['ent']), -1)
+            he = torch.cat([x['ent'], nt])
+            loc = self.loc(torch.cat([x['q'].expand(len(x['r']), -1), he[x['h']], x['rel'][x['r']], he[x['t']]], 1)).view(-1)
+            self.rbf_logit, self.loc_logit = log_to_logit(path_lp), loc
+            return log_to_logit(path_lp + F.logsigmoid(loc))
+        if 'rbfonly' in self.feat.split('+'):
+            o = self.rbf(x); self.rbf_out = o
+            self.rbf_logit = log_to_logit(o['final'] - 0.6931471805599453)   # = union for one anchor
+            return self.rbf_logit
         n_nt = x['n_ent'] - len(x['ent'])
         nt = self.non_text.weight.expand(n_nt, -1)
         if 'cvtrel' in self.feat.split('+') and n_nt > 0:
@@ -239,10 +356,16 @@ class Scorer(nn.Module):
         trip = []
         if hasattr(self, 'rt_dde'):
             ei = torch.stack([x['h'], x['t']])
-            s = 0.5 * x['lex'] + 0.5 * (x['rel'] @ x['q'].T).squeeze(-1)          # hybrid, alpha 0.5 (WL)
+            sem = x['rel_prior'][:, 0] if self.rt_src == 'bge' else (x['rel'] @ x['q'].T).squeeze(-1)
+            s = 0.5 * x['lex'] + 0.5 * sem                                         # hybrid, alpha 0.5 (WL)
             mask = torch.zeros_like(s); mask[torch.topk(s, min(5, len(s))).indices] = 1
             he += self.rt_dde(x['topic'], ei, ei.flip(0), edge_weight=torch.clamp(s[x['r']], min=0.1))
             trip.append(F.one_hot(mask[x['r']].long(), 2).float())
+        if hasattr(self, 'rbf'):
+            o = self.rbf(x)
+            self.rbf_logit = log_to_logit(o['final'] - 0.6931471805599453)
+            rl = o['rel_logit'][x['r']]
+            trip.append(torch.stack([o['union'].clamp(min=-20), o['inter'].clamp(min=-20), rl[:, 0], rl[:, 1]], 1) / 10)
         he = torch.cat(he, 1)
         feats = torch.cat([x['q'].expand(len(x['r']), -1), he[x['h']], x['rel'][x['r']], he[x['t']]] + trip, 1)
         return self.pred(feats).view(-1)
@@ -251,7 +374,7 @@ class Scorer(nn.Module):
 def build_scorer(a):
     """Scorer from a result.json 'args' dict (older runs lack the architecture keys -> SubgraphRAG defaults)."""
     return Scorer(a['feat'], d=a['d'], K=a['K'], dde_rounds=a.get('dde_rounds', 2), hidden=a.get('hidden'),
-                  layers=a.get('layers', 2))
+                  layers=a.get('layers', 2), rbf_T=a.get('rbf_T', 3), rbf_prior=bool(a.get('rbf_prior', 1)), rbf_pi=a.get('rbf_pi', 'mlp'), rbf_node=bool(a.get('rbf_node', 0)), rbf_nb=bool(a.get('rbf_nb', 0)), rbf_mm=bool(a.get('rbf_mm', 0)), rel_prior=a.get('rel_prior', 'none'), rt_src=a.get('rt_src', 'gte'))
 
 
 def pseudo_anchor(rec):
@@ -301,9 +424,10 @@ def evaluate(model, recs, emb, dev, export_k=0, passes=1, B=3):
     model.eval()
     m = defaultdict(list); exported = {}; times = []
     for rec in recs:
-        torch.cuda.synchronize(); t0 = time.perf_counter()
+        sync = torch.cuda.synchronize if dev.type == 'cuda' else (lambda: None)
+        sync(); t0 = time.perf_counter()
         logits = score_passes(model, rec, emb, dev, passes, B)
-        torch.cuda.synchronize(); times.append(time.perf_counter() - t0)
+        sync(); times.append(time.perf_counter() - t0)
         order = torch.argsort(logits, descending=True).cpu().numpy()
         grp = 'multi' if len(rec['q_ent']) > 1 else 'single'
         lab = rec['label'].astype(bool)
@@ -349,22 +473,52 @@ def main():
     ap.add_argument('--reanchor_p', type=float, default=0.0, help='AER: probability of training a question on its pass-2 anchor set')
     ap.add_argument('--pseudo_anchor_p', type=float, default=0.0, help='EXP-31 V2: prob. of adding a pseudo constraint anchor '
                     '(a text entity adjacent to a gold answer, not on the labelled triples) so single-topic WebQSP questions look multi-anchor')
+    ap.add_argument('--device', default='cuda:0', help="'cpu' is enough for --feat rbfonly (~15 ms per question)")
+    ap.add_argument('--rbf_T', type=int, default=3, help='RBF-Ret propagation steps (training and default inference)')
+    ap.add_argument('--rbf_prior', type=int, default=1, help='1 = feed the non-learned WL relation prior to pi(r|q)')
+    ap.add_argument('--rbf_pi', default='mlp', choices=['mlp', 'gate'], help="RBF relation operator: 'gate' = sigmoid(tau . WL prior + b)")
+    ap.add_argument('--rbf_node', type=int, default=0, help='1 = RBF node factor psi(v | q) (rbf.py)')
+    ap.add_argument('--rbf_nb', type=int, default=0, help='1 = non-backtracking walks (rbf.py)')
+    ap.add_argument('--rbf_mm', type=int, default=0, help='1 = complete-path max-marginal scoring (rbf.py)')
+    ap.add_argument('--rel_prior', default='none', choices=list(REL_PRIOR_DIM), help="extra relation prior for pi: 'pmh' = "
+                    "Path+Memory Hybrid selector cache (in-distribution only)")
+    ap.add_argument('--rt_src', default='gte', choices=['gte', 'bge'], help="feat 'rt': semantic half of the relation score = "
+                    "GTE <z_r, z_q> (WL) or the fine-tuned BGE cosine of --rel_prior bge/bge2 (WL + BGE, Phase 11)")
+    ap.add_argument('--rbf_ans_loss', type=float, default=0.0, help='weight of the listwise answer loss on RBF best-path '
+                    'scores (answer_softmax_loss); 0 = BCE only')
+    ap.add_argument('--rbf_aux', type=float, default=0.5, help="feat 'rbf': weight of the BCE on the RBF path-score logit")
+    ap.add_argument('--label_src', default='sp', choices=['sp', 'rational', 'union', 'sparql', 'sparql_chain', 'sparql2', 'sparql3'], help="training labels: SubgraphRAG shortest "
+                    "paths, the hybrid GPT-4o + DeepSeek rational paths (make_rational.py; SP where a question has none), or "
+                    "their union (35%% of rational triples lie on no shortest path). "
+                    "Model selection stays on SP triple recall")
     ap.add_argument('--pos_weight', default='none', choices=['none', 'effective_num'], help="'effective_num' = WL's loss")
     ap.add_argument('--anchor_aug_p', type=float, default=0.0, help='EXP-35 matched anchor augmentation probability')
     ap.add_argument('--sub_dir', default=None, help='train/val from <sub_dir>/{train,val}.pkl + emb_{split} (SubsetEmb layout), e.g. the CWQ subset of EXP-31')
+    ap.add_argument('--lean_emb', type=int, default=0, help='1 = train/val from data/<ds>/lemb_<split> (make_lean_emb.py): '
+                    'question + relation vectors and precomputed lex only, no entity vectors (RBF-only)')
     ap.add_argument('--skip_test', action='store_true', help='no test eval/export at the end (scored later, e.g. with adr_probe.py)')
     args = ap.parse_args()
     set_seed(args.seed, deterministic=True)   # same as retrieve/train.py; must run before any CUDA call
-    dev = torch.device('cuda:0'); os.makedirs(args.out, exist_ok=True)
+    dev = torch.device(args.device); os.makedirs(args.out, exist_ok=True)
     if args.sub_dir:
         train, emb_tr = load(args.dataset, 'train', data_dir=args.sub_dir)
         val, emb_va = load(args.dataset, 'val', data_dir=args.sub_dir)
     else:
-        train, emb_tr = resolve(args.dataset, 'train', args.full, args.max_cache_shards)
-        val, emb_va = resolve(args.dataset, 'val', args.full, args.max_cache_shards)
+        if args.lean_emb:
+            assert args.feat == 'rbfonly' and not args.rbf_node, '--lean_emb drops entity vectors: RBF-only, no psi'
+        train, emb_tr = resolve(args.dataset, 'train', args.full, args.max_cache_shards, lean=bool(args.lean_emb))
+        val, emb_va = resolve(args.dataset, 'val', args.full, args.max_cache_shards, lean=bool(args.lean_emb))
     if not args.skip_test:
         test, emb_te = resolve(args.dataset, 'test', args.full, args.max_cache_shards)
+        attach_rel_prior(test, args.dataset, 'test', args.rel_prior, args.dataset)
+    if args.label_src.startswith('sparql'):
+        for recs_, sp_ in ((train, 'train'), (val, 'val')):
+            apply_sparql_labels(recs_, args.dataset, sp_, with_constraints=args.label_src != 'sparql_chain',
+                                version={'sparql2': 'v2', 'sparql3': 'v3'}.get(args.label_src, ''))
+    attach_rel_prior(train, args.dataset, 'train', args.rel_prior, args.dataset)
+    attach_rel_prior(val, args.dataset, 'val', args.rel_prior, args.dataset)
     model = build_scorer(vars(args)).to(dev)
+    rational = pickle.load(open(f'{ROOT}/exp_qrdde/data/{args.dataset}/rational_train.pkl', 'rb')) if args.label_src in ('rational', 'union') else {}
     aug = pickle.load(open(f'{ROOT}/exp_qrdde/data/{args.dataset}/anchor_aug.pkl', 'rb')) if args.anchor_aug_p > 0 else {}
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     # Same wandb logging as retrieve/train.py (train loss + patience every epoch, val metrics only on
@@ -397,6 +551,10 @@ def main():
                 c, lab = random.choice(aug[rec['id']])
                 x = to_device(with_anchors(rec, set(rec['q_ent']) | {c}), emb_tr, dev)
                 x['label'][torch.tensor(lab, device=dev)] = 1.0
+            if rec['id'] in rational:
+                if args.label_src == 'rational':
+                    x['label'] = torch.zeros_like(x['label'])
+                x['label'][torch.tensor(rational[rec['id']], device=dev)] = 1.0
             pw = None
             if args.pos_weight == 'effective_num':
                 n_pos = int(x['label'].sum().item()); n_neg = len(x['label']) - n_pos
@@ -404,6 +562,10 @@ def main():
                     eff = lambda n: (1.0 - 0.999 ** n) / (1.0 - 0.999)
                     pw = torch.tensor(eff(n_neg) / (eff(n_pos) + 1e-8), device=dev)
             loss = F.binary_cross_entropy_with_logits(model(x), x['label'], pos_weight=pw)
+            if args.rbf_ans_loss > 0 and hasattr(model, 'rbf_out'):
+                loss = loss + args.rbf_ans_loss * answer_softmax_loss(model.rbf_out, x)
+            if 'rbf' in args.feat.split('+') and args.rbf_aux > 0:
+                loss = loss + args.rbf_aux * F.binary_cross_entropy_with_logits(model.rbf_logit, x['label'], pos_weight=pw)
             opt.zero_grad(); loss.backward(); opt.step(); tot += loss.item()
         v, _ = evaluate(model, val, emb_va, dev, passes=args.infer_passes, B=args.reanchor_B)
         log.append({'epoch': ep, 'loss': tot / len(train), 'sec': time.time() - t0, **{f'val_{k}': x for k, x in v.items()}})

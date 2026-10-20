@@ -6,8 +6,8 @@ DDE), passes fused by the max of z-scores.
   adr      all topics + each topic alone                adr_aer  aer on all topics + aer on each topic alone
 
   python sg_adr_infer.py -p webqsp_rt_combined_<ts>/cpt.pth [--config_file configs/retriever/transfer/..._to_cwq.yaml] \
-      --tag cwq --modes base,aer,adr,adr_aer
-Writes <ckpt dir>/adr_<tag>_<mode>.pth (top-500, same format as inference.py's retrieval_result.pth).
+      --dataset cwq --modes base,aer,adr,adr_aer
+Writes <ckpt dir>/adr_<dataset>_<mode>.pth (top-500, same format as inference.py's retrieval_result.pth).
 """
 import os, argparse
 import torch
@@ -23,16 +23,19 @@ z = lambda v: (v - v.mean()) / (v.std() + 1e-6)
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('-p', '--path', required=True)
+    ap.add_argument('-p', '--path', required=True, help='Path to checkpoint cpt.pth')
     ap.add_argument('--config_file', default=None)
-    ap.add_argument('--tag', required=True, help='output tag, e.g. webqsp or cwq')
+    ap.add_argument('--dataset', default=None, help='Target dataset to evaluate (e.g. webqsp or cwq). Defaults to checkpoint dataset.')
     ap.add_argument('--modes', default='base,aer,adr,adr_aer')
     ap.add_argument('--B', type=int, default=3)
     ap.add_argument('--max_K', type=int, default=500)
     args = ap.parse_args()
-    dev = torch.device('cuda:0')
-    cpt = torch.load(args.path, map_location='cpu')
+    dev = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    cpt = torch.load(args.path, map_location='cpu', weights_only=False)
     config = strip_listwise(load_yaml(args.config_file) if args.config_file else cpt['config'])
+    if args.dataset:
+        config['dataset']['name'] = args.dataset
+    eval_dataset = config['dataset']['name']
     set_seed(config['env']['seed'], deterministic=config['env'].get('deterministic', True))
     ds = RetrieverDataset(config=config, split='test', skip_no_path=False)
     model = Retriever(ds[0]['q_emb'].shape[-1], **config['retriever']).to(dev)
@@ -44,10 +47,20 @@ def main():
         (h, r, t, q_emb, ent, n_nt, rel, topic_oh, _, _, rtf) = prepare_sample(dev, collate_retriever([raw]))
         q_emb, ent, rel, rtf = q_emb.float(), ent.float(), rel.float(), rtf.to(dev)   # external sets store fp16
         names = raw['text_entity_list'] + raw['non_text_entity_list']; rels = raw['relation_list']
+        target_relevant_triples = []
+        if 'target_triple_probs' in raw and raw['target_triple_probs'] is not None and len(h) > 0:
+            target_ids = raw['target_triple_probs'].nonzero().reshape(-1).tolist()
+            for tid in target_ids:
+                target_relevant_triples.append((
+                    names[h[tid].item()],
+                    rels[r[tid].item()],
+                    names[t[tid].item()],
+                ))
         if len(h) == 0:
             for m in modes:
                 out[m][raw['id']] = {'question': raw['question'], 'scored_triples': [],
-                                     'a_entity_in_graph': [names[e] for e in raw['a_entity_id_list']]}
+                                     'a_entity_in_graph': [names[e] for e in raw['a_entity_id_list']],
+                                     'target_relevant_triples': []}
             return
         n = topic_oh.shape[0]; cache = {}
         def S(anchors):
@@ -73,7 +86,8 @@ def main():
                 'question': raw['question'],
                 'scored_triples': [(names[h[j].item()], rels[r[j].item()], names[t[j].item()], float(v))
                                    for v, j in zip(top.values.tolist(), top.indices.tolist())],
-                'a_entity_in_graph': [names[e] for e in raw['a_entity_id_list']]}
+                'a_entity_in_graph': [names[e] for e in raw['a_entity_id_list']],
+                'target_relevant_triples': target_relevant_triples}
 
     with torch.no_grad():
         for i in tqdm(range(len(ds))):
@@ -84,8 +98,8 @@ def main():
                 torch.cuda.empty_cache(); model.cpu(); run_one(raw, torch.device('cpu')); model.to(dev)
     d = os.path.dirname(args.path)
     for m in modes:
-        torch.save(out[m], os.path.join(d, f'adr_{args.tag}_{m}.pth'))
-    print('done', args.path, args.tag, modes)
+        torch.save(out[m], os.path.join(d, f'adr_{eval_dataset}_{m}.pth'))
+    print('done', args.path, eval_dataset, modes)
 
 
 if __name__ == '__main__':

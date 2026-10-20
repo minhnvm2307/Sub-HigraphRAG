@@ -30,6 +30,7 @@ import torch
 ROOT = '/home/minhnv/Lab/SubgraphRAG'
 RR = f'{ROOT}//relrag/runs/path_codefaithful'
 QD = f'{ROOT}/retrieve/exp_qrdde/runs'
+RR_A = f'{ROOT}/relrag/runs/authors_ckpt/cwq_model'   # REL-RAG trained on CWQ = the authors' checkpoint
 SETTINGS = {
     'webqsp': dict(kind='in_distribution',
         ref=f'{ROOT}/reason/scored_triples/webqsp_240912_unidir_test.pth',
@@ -66,14 +67,21 @@ SETTINGS = {
         ref=f'{ROOT}/reason/scored_triples/cwq_240907_unidir_test.pth',
         gpt=f'{ROOT}/reason/gpt_labeled/gpt_labeled_cwq_cleaned.pt',
         pkl=f'{ROOT}//relrag/data/cwq/test.pkl',
-        baselines={'SubgraphRAG (official)': 'REF'},
+        baselines={'SubgraphRAG (official)': 'REF',
+                   # 10-11: the authors' CWQ checkpoint (HF TianJun1/RAPL cwq.pt) in our REL-RAG repro, path_bf
+                   'REL-RAG (authors CWQ ckpt)': {50: f'{RR_A}/retrieval_cwq_test_path_bf/retrieval_result_50.pth',
+                                                  100: f'{RR_A}/retrieval_cwq_test_path_bf/retrieval_result_100.pth',
+                                                  None: f'{RR_A}/retrieval_cwq_test_path_bf/retrieval_result_500.pth'}},
         info={'DDE (our SubgraphRAG repro, CWQ)': f'{QD}/cwq_dde/adr_cwq_base.pth'},
         candidates={}),
     'cwq_to_webqsp': dict(kind='generalisation',
         ref=f'{ROOT}/reason/scored_triples/webqsp_240912_unidir_test.pth',
         gpt=f'{ROOT}/retrieve/data_files/webqsp/gpt_triples.pth',
         pkl=f'{ROOT}//relrag/data/test.pkl',
-        baselines={'SubgraphRAG (repro, trained on CWQ)': f'{QD}/cwq_dde/adr_webqsp_base.pth'},
+        baselines={'SubgraphRAG (repro, trained on CWQ)': f'{QD}/cwq_dde/adr_webqsp_base.pth',
+                   'REL-RAG (authors CWQ ckpt)': {50: f'{RR_A}/retrieval_test_path_bf/retrieval_result_50.pth',
+                                                  100: f'{RR_A}/retrieval_test_path_bf/retrieval_result_100.pth',
+                                                  None: f'{RR_A}/retrieval_test_path_bf/retrieval_result_500.pth'}},
         info={'SubgraphRAG official, trained on WebQSP (ceiling)': 'REF'},
         candidates={}),
 }

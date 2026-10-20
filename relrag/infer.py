@@ -259,7 +259,7 @@ def main():
                     help='path_free only (EXP-31, P1): add the first triple of the test shortest paths q->answer to the '
                          'start set, as the authors\' decoding(way="normal") adds topic_labels; sp_minlen = shortest only')
     args = ap.parse_args()
-    dev = torch.device('cuda:0')
+    dev = torch.device(os.environ.get('DEV', 'cuda:0'))   # DEV=cpu when the local GPU is taken
 
     # Model config comes from the training run's args.json when present, so architecture flags cannot mismatch.
     cfg_path = os.path.join(os.path.dirname(args.ckpt), 'args.json')
