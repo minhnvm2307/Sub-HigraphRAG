@@ -14,7 +14,7 @@ Prompt, LLM và cách chấm của SubgraphRAG và REL-RAG là cố định. Vì
    - In-distribution ngang nhau thì không chạy downstream in-distribution.
    - Với setting tổng quát hóa đã qua cổng, xem bảng *hiệu quả budget* (candidate@k so với baseline@2k) và độ lớn chênh lệch để quyết định có đáng chạy không, và nêu rõ lập luận trước khi xin chạy.
    - Ngoại lệ: phương pháp thay đổi chính phần reasoning.
-4. **Công cụ:** `/relrag/gate_report.py --setting {webqsp,cwq_transfer} --candidate <tên>`. Verdict dùng ansR @50/100/200; mọi metric khác và @500 chỉ để tham khảo. Output lưu ở `/relrag/runs/gate/` và được tóm tắt trong `docs/REPORT.md` §3.
+4. **Công cụ:** `retrieve/eval.py -d <webqsp|cwq> -p <file> ... --subset true` (từ 10-20; trước đó là `/relrag/gate_report.py`, có CI bootstrap; eval.py không có bootstrap). Verdict dùng ansR @50/100/200; mọi metric khác và @500 chỉ để tham khảo. Output lưu ở `/relrag/runs/gate/` và được tóm tắt trong `docs/REPORT.md` §3.
 
 ## 1. Dữ liệu
 

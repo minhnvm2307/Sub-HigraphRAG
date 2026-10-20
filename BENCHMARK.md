@@ -527,14 +527,12 @@ Sinh bởi `relrag/sparql_phase_table.py` → `relrag/runs/bench/sparql_phase.{j
 ## 7. Tái tạo số
 
 ```bash
-# retrieval (local CPU, khoảng 10 phút): mọi bảng ở mục 3
-python relrag/benchmark_all.py                      # -> relrag/runs/bench/bench_all.json, bench_all_tables.md
-# QA (local, khoảng 5 phút, không gọi LLM): mọi bảng ở mục 2
-cd reason && python -m metrics.bench_qa              # -> reason/results/bench_qa.json
-python -m metrics.paper_score <predictions.jsonl>    # chấm một file
-# phase SPARQL (mục 6): python relrag/sparql_phase_table.py; QA: reason/prompt_lab.py <T0|P2> <ds> --test --api --n 0 --k 100 --src <export>
-# export RBF: train qrdde.py (vast) -> adr_probe.py --rbf_mm 1 -> score_extra.py (đủ tập test) -> make_dynamic_export.py
+# từ 10-20 (docs/README.md "Quy trình code retrieval"): export -> bảng metric, có mẫu số in rõ ở đầu bảng
+cd retrieve/exp_qrdde && python infer.py --run <run> --dataset <webqsp|cwq> --modes base,aer,adr,adr_aer
+cd .. && python eval.py -d <webqsp|cwq> -p <name>=<export.pth> [-p ...] --subset true   # --subset false = toàn bộ tập test
+# QA: reason/prompt_lab.py <T0|P2> <ds> --test --api --n 0 --k 100 --src <export>
 ```
+Các bảng ở mục 3–6 được sinh bằng `relrag/benchmark_all.py` / `sparql_phase_table.py` (đã gộp vào `retrieve/eval.py` ngày 10-20; đã kiểm lại các dòng của mục 6, số trùng khớp). Hai bảng mục 2 cần `reason/metrics/bench_qa.py`, mà file này đang lỗi vì `metrics/paper_score.py` đã bị xoá từ 10-13.
 
 ---
 

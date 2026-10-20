@@ -21,6 +21,42 @@
 
 Báo cáo tổng hợp toàn bộ quá trình (có sơ đồ, công thức, code): [Claude Docs](https://claude.ai/code/artifact/51134e4b-fc18-41fa-a1be-36da46ce925c).
 
+## Quy trình code retrieval (từ 10-20)
+
+Chỉ giữ RT, WL, ASE, AER / ADR (lúc inference) và RBF (nb + mm). Bốn file, mỗi file một việc:
+
+```bash
+cd retrieve/exp_qrdde
+python labels.py --dataset webqsp --split train --version v2          # nhãn gold-query v1 / v2 / v3 (v3 cần v2 trước)
+python train_retriever.py --dataset webqsp --feat dde+rt --pos_weight effective_num --labels v2 --out runs/<run>   # train
+python infer.py --run <run> --dataset cwq --modes base,aer,adr,adr_aer                                             # retrieve toàn bộ tập test
+cd .. && python eval.py -d cwq -p exp_qrdde/runs/<run>/pred_cwq_base.pth -p ... --subset true                      # bảng metric
+```
+
+- `eval.py` in **mẫu số của từng nhóm metric** ở đầu bảng:
+  - `--subset true` (mặc định): chỉ các câu có đáp án trong subgraph, WebQSP 1,559 / CWQ 2,848. Đây là quy ước của mọi bảng retrieval trong BENCHMARK / report.
+  - `--subset false`: toàn bộ tập test, WebQSP 1,639 / CWQ 3,531. Câu không có đáp án trong subgraph tính ansR = 0.
+  - Câu bị thiếu trong file luôn tính 0 và có cảnh báo, không bị bỏ âm thầm.
+- **Train trên server:** `vast/remote_env.sh` (cài env) rồi `vast/remote_train.sh "<tên> | <tham số train_retriever.py>" ...`. Tune BGE: `bge_sparql_data.py` để tạo dữ liệu, `vast/remote_bge.sh` để train và chấm.
+- **Lưu ý về độ lặp lại:**
+  - WL + AER trên GPU không lặp lại từng bit giữa các lần chạy, vì DDE dùng phép cộng atomic. Trên CPU thì kết quả y hệt.
+  - RBF chạy GPU và CPU có thể lệch ±0.2 ansR do thứ tự các triple hoà điểm.
+- **File export cũ trong `runs/`:**
+  - `adr_<ds>_<mode>.pth` chỉ có các câu có đáp án (subset).
+  - `adr_<ds>_base_mm1_full.pth` có đủ tập test.
+  - File mới do `infer.py` tạo có tên `pred_<ds>_<mode>.pth`, luôn đủ tập test.
+- **Tên script cũ trong nhật ký và các tài liệu trước 10-20** (mọi số đã được kiểm lại là trùng khớp với code mới):
+
+  | Script cũ | Thay bằng |
+  |---|---|
+  | `qrdde.py` | `train_retriever.py` |
+  | `adr_probe.py`, `score_full.py`, `bge_bonus_export.py` | `infer.py` |
+  | `sparql_labels.py`, `sparql_coverage.py`, `label_compare.py` (v1), `make_sparql_v2.py`, `make_sparql_v3.py` | `labels.py` |
+  | `relrag/benchmark_all.py`, `sparql_phase_table.py`, `query_recall.py`, `gate_report.py`, `wl_adr_report.py` | `retrieve/eval.py` |
+  | `vast/*.sh` | `vast/remote_{env,train,bge}.sh` |
+
+  Đã xoá (các ablation âm hoặc hướng đã bỏ): QR-DDE, RT-DDE, các biến thể RBF (ψ, gate, poe, hybrid MLP, cmm / soft-AND, train kèm mm, không nb), nhãn rational / union, prior memory / Path+Memory, cắt theo τ / threshold, dataset ngoài (GTSQA, MetaQA, GrailQA), two-stage / listwise, HiRAG / LangGraph. Code cũ nằm ở commit `2d555d0`. Các script `.sh` cũ (bị git-ignore) được nén ở `.cleanup_backup_1020_sh.tar.gz`.
+
 ## Trạng thái (10-05)
 
 - **AER qua cổng retrieval** (`REPORT.md` §3):

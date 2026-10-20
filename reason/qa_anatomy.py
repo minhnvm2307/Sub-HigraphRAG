@@ -18,8 +18,7 @@ import torch
 run_p, ds, src_p = sys.argv[1:4]; K = int(sys.argv[4]) if len(sys.argv) > 4 else 100
 ROOT = '/home/minhnv/Lab/SubgraphRAG'
 sys.path.insert(0, f'{ROOT}/relrag'); sys.path.insert(0, f'{ROOT}/retrieve/exp_qrdde')
-import sparql_coverage as C
-from query_recall import trails
+from labels import cwq_gold_queries, triple_lookup, walk_one_trail_per_end, webqsp_gold_queries
 
 REF = {'webqsp': f'{ROOT}/reason/scored_triples/webqsp_240912_unidir_test.pth', 'cwq': f'{ROOT}/reason/scored_triples/cwq_240907_unidir_test.pth'}
 ref = torch.load(REF[ds], weights_only=False)
@@ -28,13 +27,13 @@ rows = {r['id']: r for r in map(json.loads, open(run_p))}
 
 # gold relation chains -> end nodes reachable along the chain (gold or not)
 recs = {r['id']: r for r in pickle.load(open(f'{ROOT}/retrieve/exp_qrdde/data/{ds}/test.pkl', 'rb'))}
-wq, m2n = C.webqsp_annotations()
-labels = {i: l for i, l in wq.items() if i in recs} if ds == 'webqsp' else C.cwq_labels('test', recs, m2n)[0]
+wq, m2n = webqsp_gold_queries()
+labels = {i: l for i, l in wq.items() if i in recs} if ds == 'webqsp' else cwq_gold_queries(recs, m2n)
 ends = {}
 for qid, lab in labels.items():
     rec = recs[qid]; N, L = rec['entity_names'], rec['relation_list']
     trip = [(N[h], L[r], N[t]) for h, r, t in zip(rec['h'].tolist(), rec['r'].tolist(), rec['t'].tolist())]
-    front, _ = trails(lab, trip)
+    front = walk_one_trail_per_end(lab, *triple_lookup(trip))
     ends[qid] = set(front)
 
 # literal constraints in the gold query

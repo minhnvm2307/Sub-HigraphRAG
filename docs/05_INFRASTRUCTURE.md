@@ -39,7 +39,7 @@
 | `RAPL/` | Code gốc RAPL của tác giả (tham khảo; `run_rapl_sp_eval.py`, `eval_rapl.py` là bản cũ sai của Phase 16, không dùng) |
 | `/relrag/` | **Bản tái hiện REL-RAG**: `prepare_data.py`, `gpt_label.py` (nhãn rational path theo quy trình tác giả, qua OpenRouter hoặc API DeepSeek), `merge_labels.py`, `make_memmap.py`, `dataset.py`, `model.py`, `train.py`, `infer.py`, `eval_retrieval_text.py`, `run_reason.sh`, `compare_reasoners.py`, `e2e_latency.py`, `run_paper.sh` (cấu hình paper, seed 42). Các run, nhãn và script của giai đoạn gemma đã xóa ngày 10-01 |
 | `retrieve/` | Retriever SubgraphRAG (MLP + DDE) và các thử nghiệm giai đoạn cũ |
-| `retrieve/exp_qrdde/` | **Thử nghiệm phương pháp đề xuất**: `prepare_subsets.py`, `qrdde.py`, `transfer_eval.py`, `e0_linegraph_stats.py`, `e5_latency.py`, `summarize.py`, `run_exp.sh` |
+| `retrieve/exp_qrdde/` | **Phương pháp đề xuất (từ 10-20)**: `labels.py` (nhãn gold-query v1 / v2 / v3), `train_retriever.py` (DDE / RT / WL / ASE / RBF), `rbf.py`, `infer.py` (base / AER / ADR), `relscore_bge.py` + `bge_sparql_data.py` (BGE), `prepare_full.py` (record), `vast/remote_{env,train,bge}.sh`. Eval: `retrieve/eval.py` |
 | `reason/` | Module reasoning của SubgraphRAG + eval (`metrics/evaluate_results.py` = eval gốc) |
 
 ## 5. Dữ liệu và artifact

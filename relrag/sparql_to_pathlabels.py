@@ -14,8 +14,7 @@ v2-style filter: keep only trails that END AT A GOLD ANSWER (not every trail on 
 """
 import argparse, json, pickle, sys
 sys.path.insert(0, '/home/minhnv/Lab/SubgraphRAG/retrieve/exp_qrdde')
-from make_sparql_v2 import all_trails
-from sparql_coverage import webqsp_annotations, cwq_labels
+from labels import cwq_gold_queries, triple_lookup, walk_all_trails, webqsp_gold_queries
 
 D = '/home/minhnv/Lab/SubgraphRAG/relrag/data'
 
@@ -26,7 +25,7 @@ def good_trails(lab, rec):
     ix = {}
     for k, tr in enumerate(trip):
         ix.setdefault(tr, k)                                  # first occurrence (= pair2node order, (h,t) unique)
-    trails, _, _ = all_trails(lab, trip)
+    trails = walk_all_trails(lab, *triple_lookup(trip))
     gold = set(rec['a_entity'])
     return [[ix[t] for t in tr] for end, tr in trails if end in gold and all(t in ix for t in tr)]
 
@@ -37,18 +36,18 @@ def main():
     ap.add_argument('--splits', default='train,val')
     a = ap.parse_args()
     if a.dataset == 'webqsp':
-        labels, _ = webqsp_annotations()
+        labels, _ = webqsp_gold_queries()
         path = lambda split: f'{D}/{"train" if split == "train" else "val"}.pkl'
     else:
-        _, mid2name = webqsp_annotations()
+        _, mid2name = webqsp_gold_queries()
         path = lambda split: f'{D}/cwq/{split}.pkl'
     out_d = f'{D}/labels_sparqlv2'; import os; os.makedirs(out_d, exist_ok=True)
     for split in a.splits.split(','):
         recs = {r['id']: r for r in pickle.load(open(path(split), 'rb'))}
         if a.dataset == 'cwq':
             for r in recs.values():
-                r['q_ent'] = r['q_entity_id_list']             # cwq_labels' only non-shared key name
-            labels, _ = cwq_labels(split, recs, mid2name)
+                r['q_ent'] = r['q_entity_id_list']             # the key cwq_gold_queries reads
+            labels = cwq_gold_queries(recs, mid2name)
         n_ok = n_empty = n_total = 0
         full, minlen = [], []
         for qid, rec in recs.items():

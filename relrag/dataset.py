@@ -39,25 +39,7 @@ class MemmapEmbeddings:
                 'relation_embs': torch.from_numpy(np.array(self.rel[r0:r0 + nr]))}
 
 
-class ExtEmbeddings:
-    """external benchmarks (gtsqa, metaqa3): global GTE tables of retrieve/exp_qrdde/ext_data.py; all entities are text"""
-    def __init__(self, dataset):
-        import sys
-        sys.path.insert(0, '/home/minhnv/Lab/SubgraphRAG/retrieve/exp_qrdde')
-        from ext_data import GlobalEmb
-        self.g = GlobalEmb(dataset)
-
-    def __contains__(self, sid):
-        return sid in self.g.index
-
-    def __getitem__(self, sid):
-        q, ent, rel = self.g.get(sid)
-        return {'q_emb': q, 'entity_embs': ent, 'relation_embs': rel}
-
-
 def load_embeddings(split, dataset='webqsp'):
-    if dataset in ('gtsqa', 'metaqa3', 'grailqa', 'grailqa_oda', 'grailqa_paper'):
-        return ExtEmbeddings(dataset)
     return MemmapEmbeddings(split, dataset)
 
 
