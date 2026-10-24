@@ -31,13 +31,15 @@ COMPLETION_STEPS = 2             # mm: longest continuation after a triple
 
 
 class RBF(nn.Module):
-    def __init__(self, emb=1024, hidden=256, T=3, mm=False, extra_prior=0, pi_input='full', stop=False):
+    def __init__(self, emb=1024, hidden=256, T=3, mm=False, extra_prior=0, pi_input='full', stop=False,
+                 dir_bigram=False, L=COMPLETION_STEPS):
         """emb: text-embedding size; T: propagation steps; mm: complete-path scoring (set True at test time);
         extra_prior: number of extra per-relation prior columns read from x['rel_prior'] (BGE: 2);
         pi_input: ablation of the inputs of pi ('full', 'no_lex': drop lexical(q, r), 'no_prod': drop z_q * z_r,
-        'no_lex_prod': drop both); stop: add the stop factor phi (see below)"""
+        'no_lex_prod': drop both); stop: add the stop factor phi (see below); L: completion steps of mm;
+        dir_bigram: add the direction-bigram factor psi (see below)"""
         super().__init__()
-        self.T, self.mm, self.extra_prior = T, mm, extra_prior
+        self.T, self.mm, self.extra_prior, self.L = T, mm, extra_prior, L
         self.use_lex, self.use_prod = 'lex' not in pi_input, 'prod' not in pi_input
         n_in = (3 if self.use_prod else 2) * emb + 1 + int(self.use_lex) + extra_prior
         self.pi = nn.Sequential(nn.Linear(n_in, hidden), nn.ReLU(), nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, 2))
@@ -45,6 +47,18 @@ class RBF(nn.Module):
         # there, i.e. that r is the question's answer relation. Same inputs as pi, so it still depends on (q, r) only.
         # Used by mm at test time: a complete walk pays log phi of its last step instead of stopping for free.
         self.stop = nn.Sequential(nn.Linear(n_in, hidden), nn.ReLU(), nn.Linear(hidden, 2)) if stop else None
+        # direction bigram psi(d_prev, d_cur) and first-step bias chi(d_1): 6 parameters in total, SHARED by every
+        # relation. They carry composition-ORDER information (a gold chain through a CVT has a canonical direction
+        # pattern) while no parameter is indexed by a relation or a relation pair, so the step-factorised scoring
+        # stays systematic: the scorer learns nothing it could index by "r1 then r2".
+        # Reference implementation + brute-force test: analysis/ref_semirings.py (claims C-A, C-A2).
+        # NOTE: psi is applied in the PREFIX propagation only. best_completion (mm) still scores its continuation
+        # without psi, so a dir_bigram run with mm=True mixes a psi-aware prefix with a psi-free suffix. Run the
+        # dir_bigram ablation with mm off for a clean comparison; extending psi into the completion is follow-up work.
+        self.dir_bigram = dir_bigram
+        if dir_bigram:
+            self.psi = nn.Parameter(torch.zeros(2, 2))
+            self.chi = nn.Parameter(torch.zeros(2))
 
     def relation_inputs(self, x):
         q = x['q'].expand(len(x['rel']), -1)
@@ -71,10 +85,15 @@ class RBF(nn.Module):
         log_p = torch.full((max(len(anchors), 1), n), NEG, device=h.device)                    # [anchors, nodes]
         if len(anchors):
             log_p[torch.arange(len(anchors), device=h.device), anchors] = 0.0
-        path_fwd, path_rev, log_p = propagate_non_backtracking(log_p, h, t, r, log_pi_fwd, log_pi_rev, n, self.T)
+        if self.dir_bigram:
+            path_fwd, path_rev, log_p = propagate_nb_dirbigram(log_p, h, t, r, log_pi_fwd, log_pi_rev, n, self.T,
+                                                               self.psi, self.chi)
+        else:
+            path_fwd, path_rev, log_p = propagate_non_backtracking(log_p, h, t, r, log_pi_fwd, log_pi_rev, n, self.T)
         if self.mm:
             log_stop = F.logsigmoid(self.stop_logits(x)) if self.stop is not None else None
             after_fwd, after_rev = best_completion(h, t, r, log_pi_fwd, log_pi_rev, n, n_text=len(x['ent']),
+                                                   steps=self.L,
                                                    log_stop_fwd=None if log_stop is None else log_stop[:, 0][r],
                                                    log_stop_rev=None if log_stop is None else log_stop[:, 1][r])
             path_fwd, path_rev = (path_fwd + after_fwd).clamp(min=NEG), (path_rev + after_rev).clamp(min=NEG)
@@ -132,7 +151,56 @@ def propagate_non_backtracking(log_p, h, t, r, log_pi_fwd, log_pi_rev, n, T):
             _best_without_tag(best, best_tag, second, t, tag_fwd) + log_pi_rev, best)
 
 
-def best_completion(h, t, r, log_pi_fwd, log_pi_rev, n, n_text, log_stop_fwd=None, log_stop_rev=None):
+def propagate_nb_dirbigram(log_p, h, t, r, log_pi_fwd, log_pi_rev, n, T, psi, chi):
+    """T steps of non-backtracking max-product WITH the direction-bigram factor psi and first-step bias chi.
+
+    The state is a per-direction Viterbi top-2: for each node and each LAST-STEP DIRECTION d, the best score and
+    the best score with a different last-step tag (8 scalars per node instead of 4). This is exactly what the
+    factor needs and no more: a step into direction d must exclude the single tag (r, 1 - d), and psi depends on
+    the previous DIRECTION only, so
+
+        base(src, d) = max( start(src) + chi[d],  max over d_prev [ excl(src, d_prev, (r, 1 - d)) + psi[d_prev, d] ] )
+
+    covers first steps and later steps with one expression. `log_p` supplies the boundary condition (0 at the
+    anchors) and is kept as the constant `start` row. Verified against brute force in analysis/ref_semirings.py
+    (claim C-A2); keep the two in sync.
+
+    -> (score of crossing each triple forwards [A, E], backwards [A, E], node scores [A, n])
+    """
+    start = log_p                                                     # [A, n], 0 at the anchor of each row
+    shape = log_p.shape
+    best = [torch.full(shape, NEG, device=log_p.device) for _ in range(2)]        # per last-step direction
+    second = [torch.full(shape, NEG, device=log_p.device) for _ in range(2)]
+    best_tag = [torch.full(shape, -1, dtype=torch.long, device=log_p.device) for _ in range(2)]
+    second_tag = [torch.full(shape, -2, dtype=torch.long, device=log_p.device) for _ in range(2)]
+    tag_fwd, tag_rev = 2 * r, 2 * r + 1
+    log_pi = (log_pi_fwd, log_pi_rev)
+    source = (h, t)                                                   # a step into direction d starts here
+    destination = (t, h)
+    forbidden = (tag_rev, tag_fwd)                                    # the tag a step into direction d may not follow
+
+    def base(d):
+        """[A, E]: best predecessor value at the source of a step into direction d, psi and chi included"""
+        nodes = source[d]
+        out = start[:, nodes] + chi[d]
+        for d_prev in range(2):
+            prev = _best_without_tag(best[d_prev], best_tag[d_prev], second[d_prev], nodes, forbidden[d])
+            out = torch.maximum(out, prev + psi[d_prev, d])
+        return out
+
+    for _ in range(T):
+        candidates = [base(d) + log_pi[d] for d in range(2)]           # computed before any update: one synchronous round
+        for d in range(2):
+            tags = tag_fwd if d == 0 else tag_rev
+            best[d], best_tag[d], second[d], second_tag[d] = _top2_merge(
+                best[d], best_tag[d], second[d], second_tag[d],
+                candidates[d], tags, destination[d], n)
+    node = torch.maximum(torch.maximum(best[0], best[1]), start)
+    return base(0) + log_pi_fwd, base(1) + log_pi_rev, node
+
+
+def best_completion(h, t, r, log_pi_fwd, log_pi_rev, n, n_text, log_stop_fwd=None, log_stop_rev=None,
+                    steps=COMPLETION_STEPS):
     """log score of the best non-backtracking continuation (<= COMPLETION_STEPS steps) after a forward step into t /
     a reverse step into h that stops at a text entity (nodes 0..n_text-1); anchor-independent -> [1, E] each.
     Without a stop factor, stopping at a text entity is free. With one (log_stop_* per triple = log phi of the step
@@ -150,7 +218,7 @@ def best_completion(h, t, r, log_pi_fwd, log_pi_rev, n, n_text, log_stop_fwd=Non
     destinations, tags = torch.cat([h, t]), torch.cat([tag_fwd, tag_rev])
     after = lambda node, tag, stop: (_best_without_tag(best, best_tag, second, node, tag) if stop is None
                                      else torch.maximum(_best_without_tag(best, best_tag, second, node, tag), stop))
-    for _ in range(COMPLETION_STEPS):
+    for _ in range(steps):
         step_fwd = after(t, tag_rev, stop_fwd) + log_pi_fwd   # u = h continues forward to t (and stops there or goes on)
         step_rev = after(h, tag_fwd, stop_rev) + log_pi_rev   # u = t continues back to h
         best, best_tag, second, second_tag = _top2_merge(best, best_tag, second, second_tag,

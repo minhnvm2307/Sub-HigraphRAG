@@ -13,6 +13,9 @@ Retrievers (--feat):
                ASE: + anchor-set encoding (a DDE per topic entity, embedded by a shared MLP, pooled mean / max / min)
   rbfonly      RBF-Ret (rbf.py): step-factorised max-product paths from the topic entities; no SubgraphRAG MLP.
                Trained with non-backtracking walks; switch on the complete-path max-marginal at test time (infer.py).
+RBF extras: --dir_bigram adds the direction-bigram factor psi(d_prev, d_cur) and first-step bias chi, 6
+parameters shared by every relation, so composition ORDER enters the score with no parameter indexed by a
+relation pair (docs/16). --rbf_T / --rbf_L expose the propagation and completion horizons, which were hardcoded.
 Labels (--labels): sp = SubgraphRAG shortest paths (default); v1 / v2 / v3 = gold-query labels (labels.py), questions
 without a gold-query label keep sp. Applied to train AND val, so model selection follows the same target.
 BGE relation prior (--rel_prior bge | bge2): relscore_bge.py scores of the BGE-M3 LoRA relation encoder tuned on
@@ -212,12 +215,14 @@ def epoch_order(records, emb):
 # ============================================================ model
 class Scorer(nn.Module):
     """one logit per triple; module names are those of the checkpoints in runs/ (do not rename)"""
-    def __init__(self, feat, rel_prior='none', rt_src='gte', pi_input='full', stop=False):
+    def __init__(self, feat, rel_prior='none', rt_src='gte', pi_input='full', stop=False,
+                 dir_bigram=False, rbf_T=3, rbf_L=2):
         super().__init__()
         self.feat, self.rt_src = feat, rt_src
         parts = feat.split('+')
         if 'rbfonly' in parts:
-            self.rbf = RBF(EMB, extra_prior=2 if rel_prior != 'none' else 0, pi_input=pi_input, stop=stop)
+            self.rbf = RBF(EMB, T=rbf_T, L=rbf_L, extra_prior=2 if rel_prior != 'none' else 0,
+                           pi_input=pi_input, stop=stop, dir_bigram=dir_bigram)
             return
         self.non_text = nn.Embedding(1, EMB)                    # shared vector of entities without text (CVT nodes)
         entity_dim = EMB + 2                                     # text vector + topic one-hot
@@ -264,7 +269,9 @@ class Scorer(nn.Module):
 def build_scorer(args):
     """Scorer from the 'args' of a result.json (or this script's arguments)"""
     return Scorer(args['feat'], rel_prior=args.get('rel_prior', 'none'), rt_src=args.get('rt_src', 'gte'),
-                  pi_input=args.get('pi_input', 'full'), stop=bool(args.get('stop', False)))
+                  pi_input=args.get('pi_input', 'full'), stop=bool(args.get('stop', False)),
+                  dir_bigram=bool(args.get('dir_bigram', False)),
+                  rbf_T=int(args.get('rbf_T', 3)), rbf_L=int(args.get('rbf_L', 2)))
 
 
 # ============================================================ validation + training
@@ -322,6 +329,12 @@ def main():
     ap.add_argument('--pi_input', default='full', choices=['full', 'no_lex', 'no_prod', 'no_lex_prod'],
                     help='rbfonly: ablation of the inputs of pi(r | q) (rbf.py)')
     ap.add_argument('--stop', action='store_true', help='rbfonly: add the stop factor phi(stop | q, r) (rbf.py), BCE on the gold last steps')
+    ap.add_argument('--dir_bigram', action='store_true',
+                    help='rbfonly: add the direction-bigram factor psi(d_prev, d_cur) and the first-step bias chi '
+                         '(6 parameters shared by every relation; rbf.py, docs/16). Run the ablation with mm off: '
+                         'the completion pass does not apply psi yet')
+    ap.add_argument('--rbf_T', type=int, default=3, help='rbfonly: propagation steps (was hardcoded at 3)')
+    ap.add_argument('--rbf_L', type=int, default=2, help="rbfonly: completion steps of mm (was hardcoded at 2)")
     ap.add_argument('--init_from', default=None, help='--stop only: load pi from this run (exp_qrdde/runs/<run>), freeze it and train phi alone (model selection on val stop_top1)')
     ap.add_argument('--train_eval', type=int, default=300, help='also log the val metrics on this many fixed train questions (train vs val curves); 0 = off')
     ap.add_argument('--out', required=True)

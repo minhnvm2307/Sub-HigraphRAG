@@ -19,6 +19,7 @@
 | [`13_RBF_LAP_LUAN_VA_HUONG_TIEP.md`](13_RBF_LAP_LUAN_VA_HUONG_TIEP.md) | RBF-Ret: lập luận, lợi / hại, phân rã lỗi QA, mức trần nhãn |
 | [`15_RBF_KIEN_TRUC_VA_CONG_THUC.md`](15_RBF_KIEN_TRUC_VA_CONG_THUC.md) | **Kiến trúc RBF-Ret cho bản thảo:** sơ đồ, công thức từng module, pseudo-code, mệnh đề hình thức, so sánh NBFNet / A*Net / TransferNet / REL-RAG, nhân tử dừng φ |
 | [`figs/rbf_architecture.tex`](figs/rbf_architecture.tex) | Hình kiến trúc (TikZ) cho paper |
+| [`16_HUONG_TIEP_SAU_RBF_CAU_TRUC_VA_LOSS.md`](16_HUONG_TIEP_SAU_RBF_CAU_TRUC_VA_LOSS.md) | **Hướng tiếp:** Mệnh đề 5 (trần precision), nhân tử cấu trúc (bigram hướng), CRF/margin trên walk, phân bổ budget submodular; E0–E7 có tiêu chí bác bỏ; khảo sát 10-24 |
 | [`14_TONG_KET_GIOI_HAN.md`](14_TONG_KET_GIOI_HAN.md) | **Tổng kết giai đoạn RBF (10-23): khó khăn, giới hạn, bài học cho hướng mới** |
 | [`REPORT.md`](REPORT.md) | Benchmark retrieval đầy đủ (ans, SP, GPT, GPTp; nhiều budget); §3 là kết quả cổng của AER |
 | [`papers/`](papers/) | Paper REL-RAG |
