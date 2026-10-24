@@ -34,17 +34,17 @@ def normalize(s: str) -> str:
     return s
 
 
-# def match(s1: str, s2: str) -> bool:
-#     s1 = normalize(s1)
-#     s2 = normalize(s2)
-#     return s2 in s1
-
-def match(s1: str, s2: str, n=3) -> bool:
+def match(s1: str, s2: str) -> bool:
     s1 = normalize(s1)
     s2 = normalize(s2)
-    s1_ngrams = set([s1[i:i+n] for i in range(len(s1)-n+1)])
-    s2_ngrams = set([s2[i:i+n] for i in range(len(s2)-n+1)])
-    return len(s1_ngrams.intersection(s2_ngrams)) > 0
+    return s2 in s1
+
+# def match(s1: str, s2: str, n=3) -> bool:
+#     s1 = normalize(s1)
+#     s2 = normalize(s2)
+#     s1_ngrams = set([s1[i:i+n] for i in range(len(s1)-n+1)])
+#     s2_ngrams = set([s2[i:i+n] for i in range(len(s2)-n+1)])
+#     return len(s1_ngrams.intersection(s2_ngrams)) > 0
 
 
 def remove_duplicates(input_list):

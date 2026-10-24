@@ -31,21 +31,36 @@ COMPLETION_STEPS = 2             # mm: longest continuation after a triple
 
 
 class RBF(nn.Module):
-    def __init__(self, emb=1024, hidden=256, T=3, mm=False, extra_prior=0):
+    def __init__(self, emb=1024, hidden=256, T=3, mm=False, extra_prior=0, pi_input='full', stop=False):
         """emb: text-embedding size; T: propagation steps; mm: complete-path scoring (set True at test time);
-        extra_prior: number of extra per-relation prior columns read from x['rel_prior'] (BGE: 2)"""
+        extra_prior: number of extra per-relation prior columns read from x['rel_prior'] (BGE: 2);
+        pi_input: ablation of the inputs of pi ('full', 'no_lex': drop lexical(q, r), 'no_prod': drop z_q * z_r,
+        'no_lex_prod': drop both); stop: add the stop factor phi (see below)"""
         super().__init__()
         self.T, self.mm, self.extra_prior = T, mm, extra_prior
-        n_in = 3 * emb + 2 + extra_prior
+        self.use_lex, self.use_prod = 'lex' not in pi_input, 'prod' not in pi_input
+        n_in = (3 if self.use_prod else 2) * emb + 1 + int(self.use_lex) + extra_prior
         self.pi = nn.Sequential(nn.Linear(n_in, hidden), nn.ReLU(), nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, 2))
+        # stop factor phi(stop | q, r): probability that a walk whose LAST step is relation r (forward / reverse) ends
+        # there, i.e. that r is the question's answer relation. Same inputs as pi, so it still depends on (q, r) only.
+        # Used by mm at test time: a complete walk pays log phi of its last step instead of stopping for free.
+        self.stop = nn.Sequential(nn.Linear(n_in, hidden), nn.ReLU(), nn.Linear(hidden, 2)) if stop else None
+
+    def relation_inputs(self, x):
+        q = x['q'].expand(len(x['rel']), -1)
+        parts = [q, x['rel']] + ([q * x['rel']] if self.use_prod else [])
+        parts += ([x['lex'][:, None]] if self.use_lex else []) + [F.cosine_similarity(x['rel'], q, dim=-1)[:, None]]
+        if self.extra_prior:
+            parts.append(x['rel_prior'])
+        return torch.cat(parts, 1)
 
     def relation_logits(self, x):
         """[n_relations, 2] logits of pi(r | q): column 0 = forward step, column 1 = reverse step"""
-        q = x['q'].expand(len(x['rel']), -1)
-        prior = [x['lex'][:, None], F.cosine_similarity(x['rel'], q, dim=-1)[:, None]]
-        if self.extra_prior:
-            prior.append(x['rel_prior'])
-        return self.pi(torch.cat([q, x['rel'], q * x['rel']] + prior, 1))
+        return self.pi(self.relation_inputs(x))
+
+    def stop_logits(self, x):
+        """[n_relations, 2] logits of phi(stop | q, r) for a last step forward / reverse"""
+        return self.stop(self.relation_inputs(x))
 
     def forward(self, x):
         """-> final log-score of every triple [n_triples]"""
@@ -58,7 +73,10 @@ class RBF(nn.Module):
             log_p[torch.arange(len(anchors), device=h.device), anchors] = 0.0
         path_fwd, path_rev, log_p = propagate_non_backtracking(log_p, h, t, r, log_pi_fwd, log_pi_rev, n, self.T)
         if self.mm:
-            after_fwd, after_rev = best_completion(h, t, r, log_pi_fwd, log_pi_rev, n, n_text=len(x['ent']))
+            log_stop = F.logsigmoid(self.stop_logits(x)) if self.stop is not None else None
+            after_fwd, after_rev = best_completion(h, t, r, log_pi_fwd, log_pi_rev, n, n_text=len(x['ent']),
+                                                   log_stop_fwd=None if log_stop is None else log_stop[:, 0][r],
+                                                   log_stop_rev=None if log_stop is None else log_stop[:, 1][r])
             path_fwd, path_rev = (path_fwd + after_fwd).clamp(min=NEG), (path_rev + after_rev).clamp(min=NEG)
         path = torch.maximum(path_fwd, path_rev)                                                # [anchors, triples]
         union = path.max(0).values
@@ -114,20 +132,30 @@ def propagate_non_backtracking(log_p, h, t, r, log_pi_fwd, log_pi_rev, n, T):
             _best_without_tag(best, best_tag, second, t, tag_fwd) + log_pi_rev, best)
 
 
-def best_completion(h, t, r, log_pi_fwd, log_pi_rev, n, n_text):
+def best_completion(h, t, r, log_pi_fwd, log_pi_rev, n, n_text, log_stop_fwd=None, log_stop_rev=None):
     """log score of the best non-backtracking continuation (<= COMPLETION_STEPS steps) after a forward step into t /
-    a reverse step into h that stops at a text entity (nodes 0..n_text-1); anchor-independent -> [1, E] each"""
-    best = torch.full((1, n), NEG, device=h.device); best[:, :n_text] = 0.0           # stopping at a text entity is free
+    a reverse step into h that stops at a text entity (nodes 0..n_text-1); anchor-independent -> [1, E] each.
+    Without a stop factor, stopping at a text entity is free. With one (log_stop_* per triple = log phi of the step
+    over that triple), a walk may stop right after a step into a text entity and pays log phi of that step."""
+    best = torch.full((1, n), NEG, device=h.device)
+    if log_stop_fwd is None:
+        best[:, :n_text] = 0.0                                # stopping at a text entity is free
+        stop_fwd = stop_rev = None
+    else:                                                     # stopping right after the step over the triple
+        stop_fwd = torch.where(t < n_text, log_stop_fwd, torch.full_like(log_stop_fwd, NEG))[None, :]
+        stop_rev = torch.where(h < n_text, log_stop_rev, torch.full_like(log_stop_rev, NEG))[None, :]
     best_tag = torch.full(best.shape, -1, dtype=torch.long, device=h.device)
     second, second_tag = torch.full_like(best, NEG), torch.full_like(best_tag, -2)
     tag_fwd, tag_rev = 2 * r, 2 * r + 1                       # tag = the continuation's first step
     destinations, tags = torch.cat([h, t]), torch.cat([tag_fwd, tag_rev])
+    after = lambda node, tag, stop: (_best_without_tag(best, best_tag, second, node, tag) if stop is None
+                                     else torch.maximum(_best_without_tag(best, best_tag, second, node, tag), stop))
     for _ in range(COMPLETION_STEPS):
-        step_fwd = _best_without_tag(best, best_tag, second, t, tag_rev) + log_pi_fwd   # u = h continues forward to t
-        step_rev = _best_without_tag(best, best_tag, second, h, tag_fwd) + log_pi_rev   # u = t continues back to h
+        step_fwd = after(t, tag_rev, stop_fwd) + log_pi_fwd   # u = h continues forward to t (and stops there or goes on)
+        step_rev = after(h, tag_fwd, stop_rev) + log_pi_rev   # u = t continues back to h
         best, best_tag, second, second_tag = _top2_merge(best, best_tag, second, second_tag,
                                                          torch.cat([step_fwd, step_rev], 1), tags, destinations, n)
-    return _best_without_tag(best, best_tag, second, t, tag_rev), _best_without_tag(best, best_tag, second, h, tag_fwd)
+    return after(t, tag_rev, stop_fwd), after(h, tag_fwd, stop_rev)
 
 
 def log_to_logit(log_m):

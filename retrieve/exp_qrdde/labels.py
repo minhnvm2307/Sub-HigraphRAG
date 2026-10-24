@@ -24,7 +24,7 @@ Usage (CPU only, no LLM):
   (v2 needs nothing else; v3 reads the v2 file of the same split, so build v2 first)
 
 Sources:
-  WebQSP  relrag/data/webqsp_orig/WebQSP/data/WebQSP.{train,test}.json, Parses[0]: TopicEntityName, InferentialChain,
+  WebQSP  relrag/data/webqsp_orig/WebQSP.{train,test}.json, Parses[0]: TopicEntityName, InferentialChain,
           Constraints, Order (read directly, no SPARQL parsing needed)
   CWQ     relrag/data/cwq_orig/ComplexWebQuestions_{train,dev,test}.json, field 'sparql' (parsed here). CWQ queries use
           Freebase MIDs while our records use entity names, so MIDs are mapped to names via the WebQSP annotations;
@@ -34,7 +34,7 @@ import argparse, collections, json, pickle, re
 
 ROOT = '/home/minhnv/Lab/SubgraphRAG'
 DATA = f'{ROOT}/retrieve/exp_qrdde/data'
-WEBQSP_JSON = f'{ROOT}/relrag/data/webqsp_orig/WebQSP/data'
+WEBQSP_JSON = f'{ROOT}/relrag/data/webqsp_orig'
 CWQ_JSON = f'{ROOT}/relrag/data/cwq_orig'
 LABEL_FILE = {'v1': 'sparql', 'v2': 'sparqlv2', 'v3': 'sparqlv3'}      # data/<ds>/<file>_<split>.pkl
 
@@ -234,7 +234,7 @@ def gold_queries_for(dataset, records):
     return cwq_gold_queries(records, mid_to_name)
 
 
-# ============================================================ 2. walk a gold query inside a subgraph
+# ============================== 2. walk a gold query inside a subgraph
 def subgraph_triples(record):
     """the record's triples as (head name, relation, tail name), in index order"""
     names, relations = record['entity_names'], record['relation_list']

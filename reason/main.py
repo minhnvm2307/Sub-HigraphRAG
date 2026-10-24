@@ -41,6 +41,36 @@ def save_checkpoint(file_handle, data):
     file_handle.flush()
 
 
+# Every test question with its gold answers (SubgraphRAG release): WebQSP 1,639, CWQ 3,531. 'a_entity_in_graph' marks
+# the questions of the usual subset (answer in the subgraph): WebQSP 1,559, CWQ 2,848.
+TEST_REFERENCE = {"webqsp": "./scored_triples/webqsp_240912_unidir_test.pth",
+                  "cwq": "./scored_triples/cwq_240907_unidir_test.pth"}
+
+
+def full_test_predictions(pred_file_path, dataset_name):
+    """Predictions padded to the FULL test set: a test question without a prediction (missing from the retrieval file,
+    e.g. a subset-only export, or the WebQSP question without a subgraph) gets the answer "ans: none", i.e. counts as
+    wrong.
+    Written next to the predictions as <name>-fulltest-predictions.jsonl, so --subset false always means every test
+    question."""
+    import torch
+    reference = torch.load(TEST_REFERENCE[dataset_name], weights_only=False)
+    rows = [json.loads(line) for line in open(pred_file_path)]
+    answered = {row["id"] for row in rows}
+    missing = [qid for qid in reference if qid not in answered]
+    # "ans: none", not "": both evals read it as "no answer", while an empty string is a substring of every gold answer
+    # and would count as a hit in the original eval's double-check branch (when / where / language ... questions)
+    rows += [{"id": qid, "question": reference[qid]["question"], "prediction": "ans: none", "a_entity": reference[qid]["a_entity"],
+              "supports": []} for qid in missing]
+    padded_path = Path(str(pred_file_path).replace("-predictions.jsonl", "-fulltest-predictions.jsonl"))
+    with open(padded_path, "w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+    print(f"[full test set] {len(answered)} of {len(reference)} test questions have a prediction; "
+          f"{len(missing)} without one are scored as wrong (answer 'ans: none')")
+    return padded_path
+
+
 def load_checkpoint(file_path):
     if os.path.exists(file_path):
         print("*" * 50)
@@ -60,7 +90,8 @@ def eval_all(pred_file_path, run, subset, split=None, eval_hops=-1):
 
     print("=" * 50)
     print("=" * 50)
-    print(f"Evaluating on subset: {subset}")
+    print(f"Evaluating on subset: {subset}  ->  "
+          + ("questions whose answer is in the subgraph only" if subset else "EVERY test question (missing = wrong)"))
 
     print("Results:")
     hit1, f1, prec, recall, em, tw, mi_f1, mi_prec, mi_recall, total_cnt, no_ans_cnt, no_ans_ratio, hal_score, stats = eval_results_corrected(str(pred_file_path), cal_f1=True, subset=subset, split=split, eval_hops=eval_hops)
@@ -68,25 +99,27 @@ def eval_all(pred_file_path, run, subset, split=None, eval_hops=-1):
         postfix = "_sub"
     else:
         postfix = ""
-    run.log({f"results{postfix}/hit@1": hit1,
-             f"results{postfix}/macro_f1": f1,
-             f"results{postfix}/macro_precision": prec,
-             f"results{postfix}/macro_recall": recall,
-             f"results{postfix}/exact_match": em,
-             f"results{postfix}/totally_wrong": tw,
-             f"results{postfix}/micro_f1": mi_f1,
-             f"results{postfix}/micro_precision": mi_prec,
-             f"results{postfix}/micro_recall": mi_recall,
-             f"results{postfix}/total_cnt": total_cnt,
-             f"results{postfix}/no_ans_cnt": no_ans_cnt,
-             f"results{postfix}/no_ans_ratio": no_ans_ratio,
-             f"results{postfix}/hal_score": hal_score})  # score_h in the paper
-    if stats is not None:
-        for k, v in stats.items():
-            run.log({f"stats{postfix}/{k}": v})
+    if run is not None:
+        run.log({f"results{postfix}/hit@1": hit1,
+                 f"results{postfix}/macro_f1": f1,
+                 f"results{postfix}/macro_precision": prec,
+                 f"results{postfix}/macro_recall": recall,
+                 f"results{postfix}/exact_match": em,
+                 f"results{postfix}/totally_wrong": tw,
+                 f"results{postfix}/micro_f1": mi_f1,
+                 f"results{postfix}/micro_precision": mi_prec,
+                 f"results{postfix}/micro_recall": mi_recall,
+                 f"results{postfix}/total_cnt": total_cnt,
+                 f"results{postfix}/no_ans_cnt": no_ans_cnt,
+                 f"results{postfix}/no_ans_ratio": no_ans_ratio,
+                 f"results{postfix}/hal_score": hal_score})  # score_h in the paper
+        if stats is not None:
+            for k, v in stats.items():
+                run.log({f"stats{postfix}/{k}": v})
 
     hit, _, _, _ = eval_results_original(str(pred_file_path), cal_f1=True, subset=subset, eval_hops=eval_hops)
-    run.log({f"results{postfix}/hit": hit})
+    if run is not None:
+        run.log({f"results{postfix}/hit": hit})
     print("=" * 50)
     print("=" * 50)
 
@@ -111,6 +144,9 @@ def main():
     parser.add_argument("--pred_format", choices=["ans", "raw"], default="ans", help="raw = full LLM response as in the original SubgraphRAG code (needed to compare with the papers)")
     parser.add_argument("--workers", type=int, default=1, help="concurrent LLM requests (start ollama with OLLAMA_NUM_PARALLEL >= workers)")
     parser.add_argument("--num_samples", type=int, default=None, help="Limit number of samples for testing")
+    parser.add_argument("--resume_from", type=str, default=None,
+                        help="predictions .jsonl of an earlier run with the SAME prompt / model: its answers are reused "
+                             "for the questions it covers, only the other questions are sent to the LLM")
 
     args = parser.parse_args()
     dataset_name = args.dataset_name
@@ -135,7 +171,11 @@ def main():
     run_name = f"{model_name}-{prompt_mode}-{llm_mode}-{frequency_penalty}-thres_{thres}-{split}"
     if use_custom_retrieval:
         run_name += "-custom_retrieval"
-    run = wandb.init(project=f"RAG-{dataset_name}", name=run_name, config=args)
+    try:
+        run = wandb.init(project=f"RAG-{dataset_name}", name=run_name, config=args)
+    except Exception as e:
+        print(f"[Warning] Failed to initialize wandb ({e}). Continuing without wandb tracking.")
+        run = None
 
     if args.score_dict_path is None and not use_custom_retrieval:
         if dataset_name == "webqsp":
@@ -168,6 +208,11 @@ def main():
     else:
         data = get_data(dataset_name, pred_file_path, score_dict_path, split, prompt_mode)
     
+    if split == "test":
+        import torch
+        n_test = len(torch.load(TEST_REFERENCE[dataset_name], weights_only=False))
+        print(f"[coverage] the retrieval covers {len(data)} of the {n_test} {dataset_name} test questions"
+              + ("" if len(data) == n_test else f"; the {n_test - len(data)} others are scored as wrong in the full evaluation"))
     if args.num_samples is not None:
         data = data[:args.num_samples]
         print(f"Limited evaluation to {len(data)} samples.")
@@ -177,9 +222,19 @@ def main():
     data = get_prompts_for_data(data, prompt_mode, sys_prompt, cot_prompt, thres)
 
     print("Starting inference...")
-    start_idx = len(load_checkpoint(raw_pred_file_path))
-    print(f"Resuming from index: {start_idx}")
-    
+    done_ids = {row["id"] for row in load_checkpoint(raw_pred_file_path)}
+    if args.resume_from:                                  # copy the answers of an earlier run for the questions we have
+        wanted = {qa["id"] for qa in data} - done_ids
+        reused = [row for row in load_checkpoint(args.resume_from) if row["id"] in wanted]
+        with open(raw_pred_file_path, "a") as pred_file:
+            for row in reused:
+                save_checkpoint(pred_file, row)
+        done_ids |= {row["id"] for row in reused}
+        print(f"Reused {len(reused)} answers from {args.resume_from}")
+    data = [qa for qa in data if qa["id"] not in done_ids]   # only the questions without an answer yet
+    start_idx = 0
+    print(f"Already answered: {len(done_ids)}; to send to the LLM: {len(data)}")
+
     if start_idx >= len(data):
         print("All items have already been processed. Exiting.")
     else:
@@ -239,7 +294,10 @@ def main():
     if raw_pred_file_path != final_pred_file_path:
         os.rename(raw_pred_file_path, final_pred_file_path)
     eval_all(final_pred_file_path, run, subset=True)
-    eval_all(final_pred_file_path, run, subset=False)
+    if split == "test":
+        eval_all(full_test_predictions(final_pred_file_path, dataset_name), run, subset=False)
+    else:
+        eval_all(final_pred_file_path, run, subset=False)
 
 
 

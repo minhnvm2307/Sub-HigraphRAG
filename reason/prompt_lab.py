@@ -6,6 +6,7 @@ substring match). One resumable jsonl per (variant, dataset) under results/promp
 Variants (all keep SubgraphRAG's sys_icl_dc frame: system prompt + one ICL example + the question; the ICL example is
 converted with the same function as the test context):
   T0  triples "(h,r,t)" in score order (the current pipeline)
+  G0  T0's prompt and ICL answer, the evidence regrouped by candidate answer with CVT facts (ctx_candidates)
   T1  triples with short relation names (last segment, '_' -> ' ') and CVT ids replaced by readable placeholders
   P1  reasoning paths from the topic entity: "A -> rel -> B -> rel -> C" (CVT hops folded into the path), best first
   P2  P1 + the list of candidate path ends + instructions to pick the candidates whose relation chain matches the
@@ -42,7 +43,17 @@ CVT = re.compile(r'^[mg]\.[0-9a-z_]+$')
 ICL_TOPIC = ['Lou Seal']
 TEST_SRC = {'webqsp': '../retrieve/exp_qrdde/runs/webqsp_rbfnb_bge_wl_sparql2_s42/adr_webqsp_base_mm1_full.pth',
             'cwq': '../retrieve/exp_qrdde/runs/cwq_rbfnb_bge_wl_sparql2_s42/adr_cwq_base_mm1_full.pth'}
-TEST_REF = {'webqsp': 'scored_triples/webqsp_240912_unidir_test.pth', 'cwq': 'scored_triples/cwq_240907_unidir_test.pth'}
+TEST_REF = {'webqsp': 'scored_triples/webqsp_240912_unidir_test.pth', 'cwq': 'scored_triples/cwq_240907_unidir_test.pth',
+            'grailqa_paper': '/home/minhnv/Lab/SubgraphRAG/data_ext/grailqa_paper/test.pkl'}   # 728 of the paper's 874 questions
+
+
+def load_reference(dataset):
+    """{question id: {'question', 'q_entity', 'a_entity'}} of the test set"""
+    if TEST_REF[dataset].endswith('.pkl'):                     # external sets: records of the old ext_data.py
+        import pickle
+        return {r['id']: {'question': r['question'], 'q_entity': [r['names'][i] for i in r['q_ent']],
+                          'a_entity': [r['names'][i] for i in r['a_ent']]} for r in pickle.load(open(TEST_REF[dataset], 'rb'))}
+    return torch.load(TEST_REF[dataset], weights_only=False)
 DC = ['when', 'what year', 'which year', 'where', 'sport', 'what countr', 'language', 'nba finals', 'world series']
 
 
@@ -95,38 +106,97 @@ def paths(T, topics, max_hops=3, max_paths=40):
     return lines, ends
 
 
-def ctx_paths(T, topics, with_cands=False):
-    lines, ends = paths(T, topics)
+def ranked_path_lines(ranked, max_paths=40):
+    """P2 lines from paths ranked by the retriever itself (context field 'ranked_paths': [(nodes, [(relation, reverse)])],
+    best first), formatted and de-duplicated as paths() does"""
+    lines, ends, seen = [], [], set()
+    for nodes, steps in ranked:
+        rels = tuple(short(r) + (' (of)' if rev else '') for r, rev in steps)
+        key = (tuple(n for n in nodes if not CVT.match(n)), rels)
+        if key in seen:
+            continue
+        seen.add(key)
+        parts = [nodes[0]]
+        for n, r in zip(nodes[1:], rels):
+            parts.append(f'-> {r} ->'); parts.append('[...]' if CVT.match(n) else n)
+        lines.append(' '.join(parts).replace('-> [...] ->', '->'))
+        if nodes[-1] not in ends:
+            ends.append(nodes[-1])
+        if len(lines) == max_paths:
+            break
+    return lines, ends
+
+
+def ctx_paths(T, topics, with_cands=False, ranked=None):
+    lines, ends = ranked_path_lines(ranked) if ranked else paths(T, topics)
     s = 'Reasoning paths (from the question entity, most relevant first):\n' + '\n'.join(f'{i + 1}. {l}' for i, l in enumerate(lines))
     if with_cands:
         s += '\n\nCandidate answers (path ends): ' + '; '.join(ends[:30])
     return s
 
 
+G0_MAX_CANDIDATES = 40                                         # --g0_candidates
+
+
+def ctx_candidates(T, topics, max_hops=3, max_candidates=40):
+    """G0 (10-22): the same triples regrouped by candidate answer. Every named entity reached from a question entity by a
+    simple path of <= max_hops triples (mediator / CVT nodes only in the middle) is listed once, best first (rank of
+    the path's worst triple), with its paths; a CVT on a path is shown with its other facts (role, character, dates...),
+    the conditions that tell siblings apart. Triples on no such path follow as plain triplets, so nothing is lost."""
+    adj = collections.defaultdict(list)
+    for k, (h, r, t) in enumerate(T):
+        adj[h].append((t, r, k, False)); adj[t].append((h, r, k, True))
+    found = {}                                                  # end -> [(worst rank, nodes, steps)]
+    for s in topics:
+        stack = [(s, [s], [], -1)]
+        while stack:
+            node, nodes, steps, worst = stack.pop()
+            if steps and not CVT.match(node) and node not in topics:
+                found.setdefault(node, []).append((worst, nodes, steps))
+            if len(steps) >= max_hops:
+                continue
+            for v, r, k, rev in adj[node]:
+                if v not in nodes:
+                    stack.append((v, nodes + [v], steps + [(r, k, rev)], max(worst, k)))
+    used = set()
+    def cvt_facts(c, path_nodes):
+        """the CVT's own attributes: not the path itself, not the question entity, no Freebase bookkeeping"""
+        facts = {}
+        for o, r, k, _ in sorted(adj[c], key=lambda e: e[2]):
+            used.add(k)
+            if o in path_nodes or o in topics or CVT.match(o) or r.startswith('freebase.'):
+                continue
+            facts.setdefault((r, o), k)
+        return '; '.join(f'{r} = {o}' for r, o in facts)
+    ranked = sorted(found.items(), key=lambda kv: min(p[0] for p in kv[1]))[:max_candidates]
+    lines = ['Candidate answers (entities reached from the question entity, most relevant first), each with its evidence:']
+    for i, (end, ps) in enumerate(ranked, 1):
+        lines.append(f'{i}. {end}')
+        shown_chains = set()
+        for worst, nodes, steps in sorted(ps, key=lambda p: p[0]):
+            chain = tuple(r for r, _, _ in steps)
+            if chain in shown_chains or len(shown_chains) == 2:          # at most 2 paths, with different relations
+                continue
+            shown_chains.add(chain); used.update(k for _, k, _ in steps)
+            parts = [nodes[0]]
+            for n, (r, k, rev) in zip(nodes[1:], steps):
+                parts.append(f'-> {r}{" (reverse)" if rev else ""} ->')
+                if CVT.match(n):
+                    facts = cvt_facts(n, set(nodes)) if len(shown_chains) == 1 else ''   # facts once per candidate
+                    parts.append(f'[event{": " + facts if facts else ""}]')
+                else:
+                    parts.append(n)
+            lines.append('   ' + ' '.join(parts))
+    rest = [T[k] for k in range(len(T)) if k not in used]
+    if rest:
+        lines.append('Other facts:\n' + '\n'.join(f'({h},{r},{t})' for h, r, t in rest))
+    return '\n'.join(lines)
+
+
 P2_SYS = (prompts.icl_sys_prompt + ' The evidence is given as reasoning paths that start at the entity of the question.'
           ' First decide which chain of relations the question asks for, then answer with the entities at the end of the'
           ' paths that follow that chain and satisfy every condition of the question (time, type, role, location).'
-          ' Several answers are allowed. Only if no path fits, answer from your own knowledge.')
-
-
-P3_ICL_ANS = """The question asks for the years in which the team whose mascot is Lou Seal won the World Series, so the chain of relations is: Lou Seal -> team -> (a team) -> championships -> (a World Series).
-
-Paths that follow this chain:
-- Lou Seal -> team -> San Francisco Giants -> championships -> 2010 World Series
-- Lou Seal -> team -> San Francisco Giants -> championships -> 2012 World Series
-- Lou Seal -> team -> San Francisco Giants -> championships -> 2014 World Series
-
-Paths with other relations (event, mascot, owner, stadium) do not answer the question, and every World Series reached through "championships" is a win, so all three are answers.
-
-ans: 2014 (2014 World Series)
-ans: 2012 (2012 World Series)
-ans: 2010 (2010 World Series)"""
-
-
-P4_SYS = (P2_SYS + ' Write each answer entity exactly once, using its name as it appears in the paths, without any'
-          ' explanation on the answer lines, and always finish with the answer lines.')
-P4_ICL_ANS = P3_ICL_ANS.replace('ans: 2014 (2014 World Series)\nans: 2012 (2012 World Series)\nans: 2010 (2010 World Series)',
-                                'ans: 2014 World Series\nans: 2012 World Series\nans: 2010 World Series')
+          ' Several answers are allowed.')
 
 
 def icl_triples():
@@ -134,29 +204,39 @@ def icl_triples():
     return [tuple(l.strip()[1:-1].split(',', 2)) for l in block.strip().split('\n') if l.strip()]
 
 
-def build(variant, T, topics, question):
+def build(variant, T, topics, question, ranked=None):
     if variant == 'T0':
         c = ctx_triples(T, topics)
+    elif variant == 'G0':                                      # T0 prompt, evidence grouped by candidate answer
+        c = ctx_candidates(T, topics, max_candidates=G0_MAX_CANDIDATES)
     elif variant == 'T1':
         c = ctx_triples(T, topics, short_names=True)
     else:
-        c = ctx_paths(T, topics, with_cands=variant in ('P2', 'P2b', 'P3', 'P4'))
+        c = ctx_paths(T, topics, with_cands=variant in ('P2'), ranked=ranked)
     q = question if question.endswith('?') else question + '?'
     return c + '\n\n\nQuestion:\n' + q
 
 
-def messages(variant, T, topics, question):
-    sys_p = P4_SYS if variant == 'P4' else P2_SYS if variant in ('P2', 'P2a', 'P3') else prompts.icl_sys_prompt
+def messages(variant, T, topics, question, ranked=None):
+    sys_p = P2_SYS if variant == "P2" else prompts.icl_sys_prompt
     icl_q = prompts.icl_user_prompt.split('Question:\n', 1)[1]
     return [{'role': 'system', 'content': sys_p},
             {'role': 'user', 'content': build(variant, icl_triples(), ICL_TOPIC, icl_q)},
-            {'role': 'assistant', 'content': P4_ICL_ANS if variant == 'P4' else P3_ICL_ANS if variant == 'P3' else
-             prompts.icl_ass_prompt.replace('the triplets', 'the paths') if variant.startswith('P') else prompts.icl_ass_prompt},
-            {'role': 'user', 'content': build(variant, T, topics, question)}]
+            {'role': 'assistant', 'content': prompts.icl_ass_prompt.replace('the triplets', 'the paths') if variant.startswith('P') else prompts.icl_ass_prompt},
+            {'role': 'user', 'content': build(variant, T, topics, question, ranked)}]
 
 
 LOOP_FIX = ('Your previous answer was cut off because it started repeating itself. Based on the evidence and your reasoning '
             'above, give only the final answers, one per line, each prefixed with "ans:".')
+NO_ANS_FIX = ('Your previous answer did not end with any line prefixed "ans:". Based on the evidence and your reasoning '
+              'above, give only the final answers, one per line, each prefixed with "ans:".')
+MAX_CLEAN_CHARS = 6000
+
+
+def broken(pred, fin):
+    """pure reasoning quality check (repair_runs.is_broken, inlined to avoid a circular import): no 'ans:' line,
+    a looping response, or cut at max_tokens"""
+    return 'ans:' not in pred or len(pred) > MAX_CLEAN_CHARS or fin == 'length'
 
 
 def cut_loop(text, min_len=20):
@@ -206,32 +286,52 @@ def score(pred, gold, question):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('variant', choices=['T0', 'T1', 'P1', 'P2', 'P2a', 'P2b', 'P3', 'P4']); ap.add_argument('dataset', choices=['webqsp', 'cwq'])
+    ap.add_argument('variant', choices=['T0', 'T1', 'G0', 'P1', 'P2']); ap.add_argument('dataset', choices=['webqsp', 'cwq', 'grailqa_paper'])
     ap.add_argument('--n', type=int, default=300); ap.add_argument('--k', type=int, default=50); ap.add_argument('--workers', type=int, default=2)
     ap.add_argument('--test', action='store_true'); ap.add_argument('--api', action='store_true')
     ap.add_argument('--src'); ap.add_argument('--tag'); ap.add_argument('--loop_fix', action='store_true')
+    ap.add_argument('--loop_fix_max', type=int, default=1,
+                    help='--loop_fix: retry a broken response (cut at max_tokens, looping, or no "ans:" line) this '
+                         'many times (each retry continues the SAME conversation, asking again for just the ans: '
+                         'lines); stops early once the response is clean. No chain/answer substitution (pure reasoning).')
+    ap.add_argument('--ids', help='file with one question id per line: only these questions (e.g. the errors of a run)')
+    ap.add_argument('--g0_candidates', type=int, default=40, help='G0: at most this many candidate answers are listed')
     a = ap.parse_args()
+    global G0_MAX_CANDIDATES
+    G0_MAX_CANDIDATES = a.g0_candidates
     if a.test:
-        src, ref = torch.load(a.src or TEST_SRC[a.dataset], weights_only=False), torch.load(TEST_REF[a.dataset], weights_only=False)
+        src, ref = torch.load(a.src or TEST_SRC[a.dataset], weights_only=False), load_reference(a.dataset)
         dev = {i: {'question': r['question'], 'a_entity': r.get('a_entity', []), 'q_entity': r['q_entity'],
-                   'scored_triples': src[i]['scored_triples']} for i, r in ref.items() if i in src}   # transfer exports: subset
+                   'scored_triples': src[i]['scored_triples'], 'ranked_paths': src[i].get('ranked_paths')} for i, r in ref.items() if i in src}   # transfer exports: subset
     else:                                                      # --src here: another val context file of the same shape
         dev = torch.load(a.src or f'custom_retrieval/dev_{a.dataset}_val.pth', weights_only=False)
     ids = sorted(i for i, v in dev.items() if v['a_entity'])
     random.Random(1 if a.test else 0).shuffle(ids); ids = ids[:a.n] if a.n else sorted(ids)
+    if a.ids:
+        wanted = set(open(a.ids).read().split()); ids = [i for i in ids if i in wanted]
     out_p = f'results/prompt_lab/{a.tag or f"{a.variant}_{a.dataset}_k{a.k}" + ("_test" if a.test else "")}.jsonl'
     os.makedirs('results/prompt_lab', exist_ok=True)
     done = {json.loads(l)['id'] for l in open(out_p)} if os.path.exists(out_p) else set()
     lock = threading.Lock()
     def run(i):
         v = dev[i]; T = [tuple(t[:3]) for t in v['scored_triples'][:a.k]]
-        msgs = messages(a.variant, T, v['q_entity'], v['question'])
+        msgs = messages(a.variant, T, v['q_entity'], v['question'], v.get('ranked_paths'))
         pred, fin, ntok = ask(msgs, a.api)
         row = {'id': i, 'question': v['question'], 'gold': v['a_entity'], 'finish_reason': fin, 'completion_tokens': ntok}
-        if a.loop_fix and fin == 'length':
-            head = cut_loop(pred)
-            tail, _, _ = ask(msgs + [{'role': 'assistant', 'content': head}, {'role': 'user', 'content': LOOP_FIX}], a.api, 256)
-            row['prediction_raw'] = pred; pred = head + '\n\n' + tail
+        attempts = []
+        if a.loop_fix:
+            convo = msgs
+            for _ in range(a.loop_fix_max):
+                if not broken(pred, fin):
+                    break
+                attempts.append(pred)
+                shown = cut_loop(pred) if fin == 'length' else pred            # what the model "said" before retrying
+                msg = LOOP_FIX if fin == 'length' else NO_ANS_FIX
+                convo = convo + [{'role': 'assistant', 'content': shown}, {'role': 'user', 'content': msg}]
+                tail, fin, _ = ask(convo, a.api, 256)
+                pred = shown + '\n\n' + tail
+        if attempts:
+            row['prediction_raw'] = attempts[0]; row['loop_fix_attempts'] = len(attempts)
         hit, f1 = score(pred, v['a_entity'], v['question'])
         row.update({'hit': hit, 'f1': f1, 'prediction': pred, 'prompt_chars': sum(len(m['content']) for m in msgs)})
         with lock, open(out_p, 'a') as f:

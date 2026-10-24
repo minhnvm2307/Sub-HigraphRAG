@@ -1417,3 +1417,109 @@ Kế hoạch và giả thuyết: `docs/11_KE_HOACH_TUAN_1011.md` §3–4, §7.
   - AER gánh gần hết phần tăng OOD (+7.2 ansR@50), ADR riêng +1.5, cộng lại +8.3 (79.1 → 87.4): ngang RBF_nb_mm v2, vẫn kém RBF + BGE + WL 2.9. ID gần như không đổi (−0.2 / −0.3).
   - **PathHit@50 OOD không nhích** (~53 ở mọi mode, RBF 64–66): bridge của AER đưa đáp án vào top-50 nhưng không đưa được đường đi gold từ topic. Cons-R tăng (19 → 34) nhưng còn dưới RBF + BGE + WL (51).
   - Chi phí: ~6.5 lượt mô hình / câu nhiều topic (RBF: 1 lượt). Profile GPU: một lượt WL ~55 ms, chủ yếu là `nonzero` / `index` trong DDE (đồng bộ host), không phải MLP. `adr_probe.py` giờ dùng chung cache lượt giữa các mode của cùng một câu (kết quả y hệt, nhanh gấp đôi).
+
+## EXP-42 — RBF kết hợp AER / ADR lúc inference (10-20)
+- **Setup:** `infer.py --modes base,aer,adr,adr_aer` (GPU 1080 Ti local) trên 4 checkpoint RBF_nb_mm nhãn SPARQL v2 (có / không có BGE, train WebQSP / CWQ); `eval.py --subset true`. ansR@50, PathHit@50:
+
+  | Checkpoint | WebQSP test base / AER / ADR / ADR+AER | CWQ test base / AER / ADR / ADR+AER |
+  |---|---|---|
+  | RBF v2, train WebQSP | 93.0 / 93.1 / 92.9 / 92.8; PathHit 92.4 → 91.6 | 87.3 / 86.8 / **83.4** / **81.9**; PathHit 65.9 → 54.3 |
+  | RBF + BGE + WL v2, train WebQSP | 93.2 / 93.1 / 93.1 / 93.0 | 90.5 / 90.2 / **79.6** / **79.2** |
+  | RBF v2, train CWQ | 90.3 / 89.2 / 90.3 / 89.1 | 93.1 / 92.7 / **89.7** / **89.2** |
+  | RBF + BGE + WL v2, train CWQ | 91.7 / 91.3 / 91.5 / 91.2 | 95.1 / 94.9 / **92.0** / **91.8** |
+
+- **Kết luận: âm, không dùng.**
+  - AER: trung tính đến −1.1. RBF đã lan truyền T = 3 bước từ topic, nên bridge chỉ thêm anchor dư.
+  - ADR: −3 đến −11 trên CWQ, nơi câu nhiều topic chiếm 53%. RBF xử lý nhiều anchor *chung một lượt*: hạng tử giao `inter` thưởng triple có đầu xa được mọi anchor khác chạm tới. ADR thêm các lượt một-anchor (không có hạng tử giao) rồi gộp bằng max z-score, nên đẩy các đường đi chỉ hợp lý với một topic lên top.
+  - Ngược với WL (EXP-41: AER +7.2 OOD). WL cần AER vì MLP chỉ thấy DDE 2 vòng từ topic, còn RBF có sẵn đa bước và phép giao trong mô hình.
+
+## EXP-43 — Run QA final, metric retrieval báo trước QA, vá câu hỏng (10-23)
+- **Run final** (H100 vLLM 0.10.1 bf16, P2, `--test --loop_fix`, toàn tập; các câu hỏng được chạy lại trên DeepInfra fp8 Turbo và ghi đè vào chính file, đánh dấu `origin: deepinfra_fp8_patch`; file ở `reason/results/prompt_lab/corrected_qa/final_*.jsonl`):
+
+  | Ô | Context | Hit / Hit-ans / F1 (trước vá) | Sau vá | Run cũ tham chiếu (server cũ) |
+  |---|---|---|---|---|
+  | WebQSP | dynpath τ=2 (~33 triple) | 86.9 / 85.7 / 71.9 | 86.1 / 85.7 / 71.9 | top-100: 87.9 / 87.5 / 73.1 |
+  | WebQSP → CWQ | top-50 | 58.1 / 56.5 / 48.2 | 57.9 / 56.7 / 48.6 | top-100: 60.5 / 58.7 / 50.8 |
+  | CWQ | gated m=0.25 (302 câu đi nhánh path) | 63.4 / 62.3 / 54.2 | 63.9 / 62.8 / 54.9 | top-50: 66.0 / 64.4 / 56.6 |
+
+  - Context gated và top-50 gốc có retrieval như nhau (ansR@50 76.7 cả hai; chỉ khác thứ tự triple đồng điểm). Phần chênh nằm ở reasoner và server: trên 3,112 câu chung, server cũ cho Hit-ans 69.6, server mới 66.7.
+  - Câu hỏng (không có `ans:` / bị cắt): 67 / 582 / 474. Chạy lại sửa được format khoảng 2/3, nhưng Hit-ans của nhóm này chỉ 26–28%. Đây là câu khó, không phải lỗi format thuần.
+- **Metric retrieval nào báo trước QA** (`retrieve/exp_qrdde/analysis/qa_metric/qa_metric_corr.py`; 18 run QA bf16 mỗi dataset; cặp run cùng prompt trên cùng câu, WebQSP 87k cặp, CWQ 178k cặp, bỏ dòng hỏng):
+  - ansHit@k đúng chiều 96%, ansR@k 91–95%, PathHit@k 86–91%; MRR, Q-F1, Q-P, mật độ 55–75%.
+  - Khi cả hai context đều có đáp án: PathHit +10.2 / +10.6 Hit-ans (WebQSP / CWQ), ConsAll +10.2 (CWQ); các metric còn lại ≤ +7.
+  - Checkpoint hiện chọn theo val `triple_recall@100` (nhãn SPARQL v2), không phải ansR. Đường val phẳng (CWQ từ epoch 3: ansR@50 95.6–96.7), nên đổi metric chọn checkpoint ước tính ≤ +0.2 QA. **Không train lại.**
+- **Kết luận:** hướng tối ưu ngưỡng cắt / gate / chọn checkpoint dừng lại. Tổng kết giới hạn của cả giai đoạn ở `docs/14_TONG_KET_GIOI_HAN.md`.
+
+## EXP-44 — Kiểm trần hướng "kiểm chứng ứng viên" (docs 18/19) bằng phép kiểm miễn phí, và sàn nhiễu (10-23)
+Context thật là top-100 của RBF + BGE + WL v2, prompt P2. "Nhóm anh em" là các entity trong context có cùng (head, relation) với đáp án LLM chọn. Chỉ đọc F1 / Hit-ans; Hit bị thổi lên khi thêm đáp án. Script nằm trong scratchpad, không lưu vào repo.
+
+- **E0c, thêm anh em vào đáp án** (F1):
+
+  | Run | Gốc | Thêm mù | Oracle (chỉ thêm anh em là gold) |
+  |---|---|---|---|
+  | WebQSP, Llama bf16 | 73.1 | 61.9 | 80.3 |
+  | WebQSP, GPT-4o-mini | 76.6 | 61.6 | 81.0 |
+  | CWQ, Llama bf16 | 56.2 | 37.8 | 63.5 |
+
+- **E0c-constraint, bộ lọc tất định:** chain gold + ràng buộc entity / type / value có trong subgraph; bỏ literal và order.
+  - Bộ lọc giữ 100% gold và loại khoảng 40% điểm cuối.
+  - F1 khi thay đáp án bằng tập qua lọc, so với chỉ dùng chain gold:
+    - WebQSP Llama: 80.9 (chỉ chain 79.8);
+    - CWQ: 56.7 (chỉ chain 53.6), **chỉ +0.5 so với LLM**.
+  - CWQ có 1,801 ràng buộc dạng `?v` (literal / order), so với 1,033 ràng buộc value / type.
+- **Tính tách được của đặc trưng**, CWQ val, 1,636 nhóm điểm cuối của chain gold, AUC trong nhóm:
+  - nối ≤ 2 bước tới entity khác trong câu hỏi 0.720; trùng từ với lân cận 0.699; bậc 0.675; cos(câu hỏi, notable_types) 0.493.
+  - Gộp bằng hồi quy logistic (2-fold): AUC 0.774. Khi giữ 95.6% gold thì loại được 50.3% ứng viên sai.
+- **E0c-g, áp g đó lên nhóm anh em trong context test:**
+  - F1 giảm ở mọi biến thể: CWQ 56.2 → 48.3 (top-1) / 40.1 (giữ 95% gold); WebQSP 73.1 → 65.2 / 63.8.
+  - Khi g chọn khác LLM (câu một đáp án, nhóm ≥ 2): CWQ thì **LLM đúng 223, g đúng 56**; WebQSP 105 so với 52.
+- **Sàn nhiễu**, DeepInfra Llama-3.1-8B Turbo fp8, RBF P2 top-100, 2 lượt:
+
+  | | Lượt 1 / lượt 2: Hit-ans / F1 | Output trùng nhau | Câu đổi Hit-ans | SD bootstrap của hiệu hai lượt |
+  |---|---|---|---|---|
+  | WebQSP | 85.2 / 71.4 và 85.4 / 71.1 | 60.7% | 1.9% | 0.34 |
+  | CWQ | 59.9 / 52.6 và 60.5 / 53.0 | 46.5% | 6.7% | 0.43 |
+
+- **Kết luận:**
+  - Trên cùng endpoint, nhiễu giữa các lượt chạy nhỏ hơn 1 điểm. Mức 2–3 điểm trước đây là do đổi server. DeepInfra fp8 thấp hơn bf16 khoảng 4 Hit-ans trên CWQ (60 so với 64.5).
+  - Khoảng oracle chọn anh em (CWQ +7.3 F1) là thật, nhưng **không lấy được từ thông tin có trong subgraph**: ràng buộc tường minh chỉ thêm +0.5, và một bộ chấm học được (AUC 0.77) thua chính LLM theo tỷ lệ 4 : 1.
+  - Phần còn thiếu nằm ở literal / order, tức là dữ liệu, không phải kiến trúc. Theo quy tắc dừng ở docs 19 §6: **dừng hướng B (bộ chấm ứng viên) trên dữ liệu hiện tại.**
+
+## EXP-45 — Chẩn đoán N1, nhân tử dừng φ, ablation đầu vào π, pilot QA (10-23)
+Model: RBF + BGE + WL nhãn v2. Train và infer trên GPU local 1080 Ti. Script phân tích nằm trong scratchpad; code mới đã vào repo: `--pi_input`, `--stop`, `--init_from` (`train_retriever.py`), head φ (`rbf.py`), `ranked_paths` (`reason/prompt_lab.py`).
+
+- **Chẩn đoán xếp hạng chain khi transfer** (CWQ test, model train trên WebQSP, 2,369 câu có đáp án trong top-5 chain). Chain hạng 1 là:
+  - đúng: 48.8%;
+  - **chain kết thúc bằng `notable_types`: 21.1%**;
+  - **dừng sớm ở entity cầu nối (tiền tố của chain gold, hoà điểm ở 77%): 12.7%**;
+  - relation khác, cùng anchor: 9.9%; anchor khác: 5.2%; cùng relation đầu, khác bước sau: 2.3%.
+  - Độ dài câu không ảnh hưởng (67–70%), nên bác bỏ Ha (loãng z_q); Hb và Hc nhỏ.
+  - Theo nhóm so với WebQSP train: khoảng 94% phần mất do transfer nằm ở nhóm "relation và chain đều đã thấy" (68.3% so với 85.9% của model ID). Nhóm "chain mới" khó ở cả ID lẫn OOD (khoảng 22%).
+  - Nguyên nhân: max-product không có nhân tử dừng (tiền tố luôn ≥ đường đầy đủ), và node kiểu được tính như entity có tên.
+- **Nhân tử dừng φ(dừng | q, r, chiều)**: head MLP cùng đầu vào với π. Nhãn dương là bước cuối của trail gold đi vào đáp án. π đóng băng, chỉ train φ (`--stop --init_from`); mm trả log φ thay vì dừng miễn phí.
+
+  | | Chain hạng 1 đúng: π → π + φ | ansR@50 | PathHit@50 |
+  |---|---|---|---|
+  | WebQSP | 79.5 → 87.7 | 93.5 → 94.1 | 93.6 → 93.9 |
+  | CWQ (ID) | 58.3 → 81.6 | 95.1 → 95.2 | 85.7 → 85.7 |
+  | WebQSP → CWQ | 45.0 → 66.8 | 90.3 → 91.4 | 64.0 → 66.5 |
+
+  - Nhóm tổ hợp mới (597 câu CWQ; relation đã thấy, chain mới), ansR@50: 87.4 → 89.9; SubgraphRAG DDE đạt 61.1.
+  - Quy tắc thủ công (bỏ chain kiểu, ưu tiên chain dài hơn khi hoà điểm) chỉ đạt 59.1%. Chặn hẳn relation kiểu thì Cons-R giảm 9 điểm.
+- **Ablation đầu vào π** (train lại bằng code hiện tại, WebQSP, 1 seed), ansR@50 WebQSP / WebQSP→CWQ:
+  - full: 93.0 / 90.3;
+  - **no_lex: 93.7 / 92.0** (chain hạng 1 transfer 52.4 so với 45.0);
+  - no_prod: 92.8 / 90.7;
+  - **no_lex + φ: 94.1 / 92.2** (chain hạng 1 transfer 70.1).
+  - Run no_lex_prod đang chạy.
+- **Reasoner rỗng** (trả lời bằng mọi điểm cuối của chain hạng 1 có φ), Hit trên toàn tập:
+  - CWQ: 64.6 (Llama bf16: 66.1; hợp hai bên 80.2; Llama sai nhưng chain đúng 14.1%);
+  - WebQSP→CWQ: 51.1 (Llama 60.5; hợp 73.6);
+  - WebQSP: 82.7 (Llama 87.9).
+- **Pilot QA**, DeepInfra fp8, P2, 40 path xếp theo π + φ (`ranked_paths`), so với baseline cùng endpoint:
+  - CWQ ID: Hit-ans −4.1 đến −4.7, F1 −5.5 đến −6.0 (CI loại 0);
+  - WebQSP→CWQ: Hit-ans −1.3 [−2.7, +0.1], F1 −1.6.
+  - Nguyên nhân: danh sách xếp theo φ đưa vào nhiều ứng viên hơn (CWQ ID 19.8 so với 14.7; transfer 25.4 so với 18.6), phủ ít anchor hơn, và tỷ lệ có đáp án trong các path hiển thị không tăng (73.8 so với 75.8).
+- **Kết luận:**
+  - φ là cải tiến retrieval thật cho xếp hạng chain, ansR khi transfer và nhóm tổ hợp mới. Nhưng **đưa thẳng thứ tự chain vào prompt P2 thì có hại**, vì số ứng viên tăng, khớp với EXP-43 (CWQ: ít ứng viên thì tốt hơn).
+  - Muốn dùng φ cho QA thì phải giữ số ứng viên không tăng, ví dụ chỉ đổi thứ tự các path P2 vốn có. Hoặc dùng bản no_lex + φ với context top-k triple chuẩn.

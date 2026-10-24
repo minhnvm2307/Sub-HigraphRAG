@@ -37,7 +37,7 @@ REFERENCE = {   # full test question list + answers in the subgraph (SubgraphRAG
     'cwq': dict(answers=f'{ROOT}/reason/scored_triples/cwq_240907_unidir_test.pth',
                 shortest_paths=f'{ROOT}/relrag/data/cwq/test.pkl', gpt=f'{ROOT}/reason/gpt_labeled/gpt_labeled_cwq_cleaned.pt'),
 }
-COLUMNS = (['ansR@50', 'ansR@100', 'ansR@200', 'ansR@500', 'SP-R@50', 'SP-R@100', 'SP-F1@50', 'GPT-R@50', 'GPT-R@100',
+COLUMNS = (['ansR@50', 'ansR@100', 'ansR@200', 'ansR@500', 
             'PathHit@50', 'PathHit@100', 'PathAll@50', 'Chain-R@50', 'Cons-R@50', 'Q-F1@50'])
 
 
@@ -76,14 +76,14 @@ def score_file(retrieved, question_ids, answers, shortest_paths, gpt, gold):
             entities = {x[0] for x in top} | {x[2] for x in top}
             values[f'ansR@{k}'].append(len(answers[qid] & entities) / len(answers[qid]) if qid in answers else 0.0)
         top_triples = {k: {tuple(x[:3]) for x in ranked[:k]} for k in (50, 100)}
-        if qid in shortest_paths:
-            sp = shortest_paths[qid]
-            values['SP-R@50'].append(len(sp & top_triples[50]) / len(sp))
-            values['SP-R@100'].append(len(sp & top_triples[100]) / len(sp))
-            values['SP-F1@50'].append(f1(len(sp & top_triples[50]), max(len(top_triples[50]), 1), len(sp)))
-        if qid in gpt:
-            values['GPT-R@50'].append(len(gpt[qid] & top_triples[50]) / len(gpt[qid]))
-            values['GPT-R@100'].append(len(gpt[qid] & top_triples[100]) / len(gpt[qid]))
+        # if qid in shortest_paths:
+        #     sp = shortest_paths[qid]
+        #     values['SP-R@50'].append(len(sp & top_triples[50]) / len(sp))
+        #     values['SP-R@100'].append(len(sp & top_triples[100]) / len(sp))
+        #     values['SP-F1@50'].append(f1(len(sp & top_triples[50]), max(len(top_triples[50]), 1), len(sp)))
+        # if qid in gpt:
+        #     values['GPT-R@50'].append(len(gpt[qid] & top_triples[50]) / len(gpt[qid]))
+        #     values['GPT-R@100'].append(len(gpt[qid] & top_triples[100]) / len(gpt[qid]))
         if qid in gold:
             chain, constraints, trails = gold[qid]
             values['PathHit@50'].append(any(t <= top_triples[50] for t in trails))
@@ -103,7 +103,7 @@ def print_table(dataset, subset, n_test, question_ids, rows, counts, coverage):
     scope = ('ONLY questions whose answer is in the subgraph (SubgraphRAG convention)' if subset
              else 'FULL test set (answer not in the subgraph -> ansR 0)')
     print(f'\n==== {dataset} test | --subset {str(subset).lower()} | {len(question_ids)} of {n_test} questions: {scope} ====')
-    print(f'denominators: ansR {family("ansR")} | SP {family("SP-R")} | GPT {family("GPT-R")} | gold query: '
+    print(f'denominators: ansR {family("ansR")} | gold query: '
           f'PathHit/Chain-R/Q-F1 {family("PathHit")}, Cons-R {family("Cons-R")} (questions with constraint triples)')
     for name, (found, missing) in coverage.items():
         if missing:

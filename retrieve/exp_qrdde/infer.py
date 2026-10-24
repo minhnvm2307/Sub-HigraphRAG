@@ -74,7 +74,7 @@ class QuestionScorer:
 def main():
     ap = argparse.ArgumentParser(description='Retrieve top-500 triples for every test question (see the docstring).')
     ap.add_argument('--run', required=True, help='run directory name in exp_qrdde/runs (or a path)')
-    ap.add_argument('--dataset', required=True, choices=['webqsp', 'cwq'], help='test set to retrieve on')
+    ap.add_argument('--dataset', required=True, choices=['webqsp', 'cwq', 'grailqa_paper'], help='test set to retrieve on')
     ap.add_argument('--modes', default='base', help=f'comma-separated, from {MODES}')
     ap.add_argument('--device', default='cuda:0')
     args = ap.parse_args()
@@ -90,6 +90,8 @@ def main():
     questions = []
     for split in ('test', 'test_extra'):
         records, emb = load_split(args.dataset, split)
+        if not records:                                        # external sets have no test_extra
+            continue
         attach_bge_prior(records, args.dataset, split, train_args.get('rel_prior', 'none'))
         questions += [(rec, emb) for rec in records]
     out = {mode: {} for mode in modes}

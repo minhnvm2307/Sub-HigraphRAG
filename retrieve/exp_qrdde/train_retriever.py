@@ -16,7 +16,8 @@ Retrievers (--feat):
 Labels (--labels): sp = SubgraphRAG shortest paths (default); v1 / v2 / v3 = gold-query labels (labels.py), questions
 without a gold-query label keep sp. Applied to train AND val, so model selection follows the same target.
 BGE relation prior (--rel_prior bge | bge2): relscore_bge.py scores of the BGE-M3 LoRA relation encoder tuned on
-WebQSP train (bge: shortest-path positives; bge2: SPARQL v2 positives), read by RBF (an input of pi) and by RT with
+WebQSP train (bge: shortest-path positives; bge2: SPARQL v2 positives) or on a 5k subset of CWQ train (bge_cwq: SPARQL v2
+positives, bge_sparql_data.py --max-questions 5000), read by RBF (an input of pi) and by RT with
 --rt_src bge.
 
   python train_retriever.py --dataset webqsp --feat dde+rt --pos_weight effective_num --labels v2 --out runs/webqsp_wl_v2
@@ -36,6 +37,8 @@ from tqdm import tqdm
 ROOT = os.environ.get('SGRAG_RETRIEVE', '/home/minhnv/Lab/SubgraphRAG/retrieve')   # override on other machines
 RELRAG = '/home/minhnv/Lab/SubgraphRAG/relrag'                                        # holds the WebQSP / CWQ memmaps
 DATA = f'{ROOT}/exp_qrdde/data'
+RUNS = f'{ROOT}/exp_qrdde/runs'
+EXTERNAL = {'grailqa_paper': '/home/minhnv/Lab/SubgraphRAG/data_ext/grailqa_paper'}   # test-only sets (old ext_data.py layout)
 sys.path.insert(0, ROOT)
 from src.model.retriever import DDE
 from src.dataset.retriever import ShardedEmbDict, compute_lexical_score, clean_text
@@ -44,7 +47,7 @@ from rbf import RBF, log_to_logit
 
 FEATURES = ['dde', 'dde+rt', 'dde+ase', 'dde+rt+ase', 'rbfonly']
 LABEL_FILES = {'v1': 'sparql', 'v2': 'sparqlv2', 'v3': 'sparqlv3'}                   # data/<ds>/<file>_<split>.pkl
-BGE_SCORE_DIRS = {'bge': 'scores_ft', 'bge2': 'scores_ft_sparql2'}                   # data/bge_p11/<dir>/<ds>_<split>.pkl
+BGE_SCORE_DIRS = {'bge': 'scores_ft', 'bge2': 'scores_ft_sparql2', 'bge_cwq': 'scores_cwq5k'}   # data/bge_p11/<dir>/<ds>_<split>.pkl
 EMB, ASE_DIM, DDE_ROUNDS, RT_TOP_RELATIONS, RT_FLOOR = 1024, 64, 2, 5, 0.1
 VAL_K = [20, 50, 100, 200]
 
@@ -103,6 +106,14 @@ class RelationOnlyEmb:
 def load_split(dataset, split, relation_only=False):
     """-> (records, embedding store). Records: data/<ds>/<split>.pkl ('test' = questions with an answer in the graph;
     'test_extra' = the other test questions). relation_only: RBF training tables (also sets rec['lex'])."""
+    if dataset in EXTERNAL:                                    # one test file, global GTE tables in <dir>/emb
+        if split != 'test':
+            return [], None
+        records = pickle.load(open(f'{EXTERNAL[dataset]}/test.pkl', 'rb'))
+        for rec in records:                                    # field names of the main datasets
+            rec['entity_names'], rec['relation_list'] = rec.pop('names'), rec.pop('rels')
+            rec['label'] = np.zeros(len(rec['h']), np.float32)
+        return records, GlobalEmb(f'{EXTERNAL[dataset]}/emb')
     records = pickle.load(open(f'{DATA}/{dataset}/{split}.pkl', 'rb'))
     split_dir = 'test' if split == 'test_extra' else split                   # test_extra shares the test embeddings
     if relation_only:
@@ -129,7 +140,7 @@ def apply_gold_query_labels(records, dataset, split, version):
         label = labels.get(rec['id'])
         if label and label['chain']:
             new = np.zeros_like(rec['label']); new[label['chain'] + label['cons']] = 1
-            rec['label'] = new; n_relabelled += 1
+            rec['label'] = new; rec['chain_idx'] = np.array(label['chain']); n_relabelled += 1
     print(f'[labels {version}] {dataset} {split}: {n_relabelled}/{len(records)} records relabelled, '
           f'{len(records) - n_relabelled} keep the shortest-path label', flush=True)
 
@@ -167,7 +178,23 @@ def to_device(rec, emb, device, anchors=None):
             'q': q.float().to(device), 'ent': ent.float().to(device), 'rel': rel.float().to(device),
             'topic': F.one_hot(topic, 2).float().to(device), 'lex': torch.from_numpy(lexical(rec)).to(device),
             'label': torch.from_numpy(rec['label'].astype(np.float32)).to(device),
-            'rel_prior': torch.from_numpy(rec['rel_prior']).to(device) if 'rel_prior' in rec else None}
+            'rel_prior': torch.from_numpy(rec['rel_prior']).to(device) if 'rel_prior' in rec else None,
+            **stop_targets(rec, len(rel), device)}
+
+
+def stop_targets(rec, n_rel, device):
+    """targets of the stop factor phi, [n_relations, 2] (forward / reverse last step):
+    stop_label = 1 for the last step of a gold walk, i.e. a chain triple (shortest-path triple without a gold-query
+    label) whose far end is a gold answer; stop_mask = 1 where such a last step exists at all (a step of that relation
+    and direction into a text entity, i.e. a place a walk may stop)"""
+    h, r, t, n_text = rec['h'], rec['r'], rec['t'], rec['n_text']
+    answers = np.zeros(rec['n_ent'], dtype=bool); answers[list(rec.get('a_ent', []))] = True
+    on_chain = rec['chain_idx'] if 'chain_idx' in rec else np.nonzero(rec['label'])[0]
+    label, mask = np.zeros((n_rel, 2), np.float32), np.zeros((n_rel, 2), np.float32)
+    mask[r[t < n_text], 0] = 1; mask[r[h < n_text], 1] = 1
+    label[r[on_chain][answers[t[on_chain]]], 0] = 1; label[r[on_chain][answers[h[on_chain]]], 1] = 1
+    as_t = lambda a: torch.from_numpy(a).to(device)
+    return {'stop_label': as_t(label), 'stop_mask': as_t(mask)}
 
 
 def epoch_order(records, emb):
@@ -185,12 +212,12 @@ def epoch_order(records, emb):
 # ============================================================ model
 class Scorer(nn.Module):
     """one logit per triple; module names are those of the checkpoints in runs/ (do not rename)"""
-    def __init__(self, feat, rel_prior='none', rt_src='gte'):
+    def __init__(self, feat, rel_prior='none', rt_src='gte', pi_input='full', stop=False):
         super().__init__()
         self.feat, self.rt_src = feat, rt_src
         parts = feat.split('+')
         if 'rbfonly' in parts:
-            self.rbf = RBF(EMB, extra_prior=2 if rel_prior != 'none' else 0)
+            self.rbf = RBF(EMB, extra_prior=2 if rel_prior != 'none' else 0, pi_input=pi_input, stop=stop)
             return
         self.non_text = nn.Embedding(1, EMB)                    # shared vector of entities without text (CVT nodes)
         entity_dim = EMB + 2                                     # text vector + topic one-hot
@@ -236,7 +263,8 @@ class Scorer(nn.Module):
 
 def build_scorer(args):
     """Scorer from the 'args' of a result.json (or this script's arguments)"""
-    return Scorer(args['feat'], rel_prior=args.get('rel_prior', 'none'), rt_src=args.get('rt_src', 'gte'))
+    return Scorer(args['feat'], rel_prior=args.get('rel_prior', 'none'), rt_src=args.get('rt_src', 'gte'),
+                  pi_input=args.get('pi_input', 'full'), stop=bool(args.get('stop', False)))
 
 
 # ============================================================ validation + training
@@ -245,8 +273,13 @@ def validate(model, records, emb, device):
     """answer recall and triple recall (against the training labels) at VAL_K"""
     model.eval()
     metrics = defaultdict(list)
+    stop_head = getattr(getattr(model, 'rbf', None), 'stop', None) is not None
     for rec in records:
-        order = torch.argsort(model(to_device(rec, emb, device)), descending=True).cpu().numpy()
+        x = to_device(rec, emb, device)
+        if stop_head and x['stop_label'].sum() > 0:             # the most likely last step is a gold one
+            logits = model.rbf.stop_logits(x).masked_fill(x['stop_mask'] == 0, -1e9)
+            metrics['stop_top1'].append(float(x['stop_label'].flatten()[logits.argmax()] > 0))
+        order = torch.argsort(model(x), descending=True).cpu().numpy()
         positive = rec['label'].astype(bool)
         for k in VAL_K:
             top = order[:k]
@@ -256,6 +289,17 @@ def validate(model, records, emb, device):
                 metrics[f'triple_recall@{k}'].append(positive[top].sum() / positive.sum())
     model.train()
     return {k: float(np.mean(v)) for k, v in metrics.items()}
+
+
+def stop_loss(model, x):
+    """BCE of the stop factor over the possible last steps of the question, positives and negatives weighted
+    equally (a question has a few gold last steps among tens of relations); 0 without a gold last step"""
+    mask, label = x['stop_mask'] > 0, x['stop_label']
+    if not (label[mask] > 0).any():
+        return 0.0
+    bce = F.binary_cross_entropy_with_logits(model.rbf.stop_logits(x), label, reduction='none')
+    pos, neg = mask & (label > 0), mask & (label == 0)
+    return 0.5 * bce[pos].mean() + (0.5 * bce[neg].mean() if neg.any() else 0.0)
 
 
 def effective_number_weight(labels):
@@ -273,8 +317,13 @@ def main():
     ap.add_argument('--feat', required=True, choices=FEATURES)
     ap.add_argument('--labels', default='sp', choices=['sp', 'v1', 'v2', 'v3'], help='training labels (labels.py)')
     ap.add_argument('--pos_weight', default='none', choices=['none', 'effective_num'], help="'effective_num' = WL's loss")
-    ap.add_argument('--rel_prior', default='none', choices=['none', 'bge', 'bge2'], help='BGE relation prior (RBF input / RT score)')
+    ap.add_argument('--rel_prior', default='none', choices=['none', 'bge', 'bge2', 'bge_cwq'], help='BGE relation prior (RBF input / RT score)')
     ap.add_argument('--rt_src', default='gte', choices=['gte', 'bge'], help="semantic half of RT's relation score")
+    ap.add_argument('--pi_input', default='full', choices=['full', 'no_lex', 'no_prod', 'no_lex_prod'],
+                    help='rbfonly: ablation of the inputs of pi(r | q) (rbf.py)')
+    ap.add_argument('--stop', action='store_true', help='rbfonly: add the stop factor phi(stop | q, r) (rbf.py), BCE on the gold last steps')
+    ap.add_argument('--init_from', default=None, help='--stop only: load pi from this run (exp_qrdde/runs/<run>), freeze it and train phi alone (model selection on val stop_top1)')
+    ap.add_argument('--train_eval', type=int, default=300, help='also log the val metrics on this many fixed train questions (train vs val curves); 0 = off')
     ap.add_argument('--out', required=True)
     ap.add_argument('--device', default='cuda:0', help="'cpu' is enough for rbfonly")
     ap.add_argument('--seed', type=int, default=42)
@@ -294,7 +343,14 @@ def main():
             apply_gold_query_labels(records, args.dataset, split, args.labels)
         attach_bge_prior(records, args.dataset, split, args.rel_prior)
     model = build_scorer(vars(args)).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    if args.init_from:                                          # stop factor only: pi frozen at a trained run
+        missing, _ = model.load_state_dict(torch.load(f'{RUNS}/{args.init_from}/best.pt', map_location=device), strict=False)
+        assert all(k.startswith('rbf.stop') for k in missing), missing
+        for name, p in model.named_parameters():
+            p.requires_grad = name.startswith('rbf.stop')
+    optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=1e-3)
+    select = 'stop_top1' if args.init_from else 'triple_recall@100'
+    train_probe = random.Random(0).sample(train, min(args.train_eval, len(train))) if args.train_eval else []
     # wandb as retrieve/train.py (project REL-RAG); WANDB_MODE=disabled turns it off
     wandb.init(project='REL-RAG', name=f'{os.path.basename(os.path.normpath(args.out))}_{time.strftime("%b%d-%H:%M:%S", time.gmtime())}',
                config=vars(args))
@@ -302,29 +358,36 @@ def main():
     if args.resume:                                             # the resumed weights are the current best
         model.load_state_dict(torch.load(args.resume, map_location=device))
         v = validate(model, val, emb_val, device)
-        best = v['triple_recall@100']; torch.save(model.state_dict(), f'{args.out}/best.pt')
+        best = v[select]; torch.save(model.state_dict(), f'{args.out}/best.pt')
         log.append({'epoch': args.start_epoch - 1, 'resumed_from': args.resume, **{f'val_{k}': x for k, x in v.items()}})
     for epoch in range(args.start_epoch, args.epochs):
         t0, total_loss = time.time(), 0.0
         for rec in tqdm(epoch_order(train, emb_train), desc=f'epoch {epoch}'):
             x = to_device(rec, emb_train, device)
-            weight = effective_number_weight(x['label']) if args.pos_weight == 'effective_num' else None
-            loss = F.binary_cross_entropy_with_logits(model(x), x['label'], pos_weight=weight)
+            loss = stop_loss(model, x) if args.stop else 0.0
+            if not args.init_from:
+                weight = effective_number_weight(x['label']) if args.pos_weight == 'effective_num' else None
+                loss = loss + F.binary_cross_entropy_with_logits(model(x), x['label'], pos_weight=weight)
+            if not torch.is_tensor(loss):
+                continue
             optimizer.zero_grad(); loss.backward(); optimizer.step(); total_loss += loss.item()
         v = validate(model, val, emb_val, device)
-        log.append({'epoch': epoch, 'loss': total_loss / len(train), 'sec': time.time() - t0, **{f'val_{k}': x for k, x in v.items()}})
-        improved = v['triple_recall@100'] > best
+        vt = validate(model, train_probe, emb_train, device) if train_probe else {}    # same metrics on train questions
+        log.append({'epoch': epoch, 'loss': total_loss / len(train), 'sec': time.time() - t0, **{f'val_{k}': x for k, x in v.items()},
+                    **{f'train_{k}': x for k, x in vt.items()}})
+        improved = v[select] > best
         if improved:
-            best, epochs_without_gain = v['triple_recall@100'], 0
+            best, epochs_without_gain = v[select], 0
             torch.save(model.state_dict(), f'{args.out}/best.pt')
         else:
             epochs_without_gain += 1
-        print(f'epoch {epoch}: loss {total_loss / len(train):.4f}  val triple_recall@100 {v["triple_recall@100"]:.4f}  '
+        print(f'epoch {epoch}: loss {total_loss / len(train):.4f}  val {select} {v[select]:.4f}  '
               f'ans_recall@50 {v["ans_recall@50"]:.4f}' + ('  (best, saved)' if improved else f'  ({epochs_without_gain} without gain)'), flush=True)
-        wandb.log({'epoch': epoch, 'loss': total_loss / len(train), **{f'val/{k}': x for k, x in v.items()}})
+        wandb.log({'epoch': epoch, 'loss': total_loss / len(train), **{f'val/{k}': x for k, x in v.items()},
+                   **{f'train/{k}': x for k, x in vt.items()}})
         if epochs_without_gain >= args.patience:
             break
-    best_epoch = max(log, key=lambda e: e['val_triple_recall@100'])['epoch']
+    best_epoch = max(log, key=lambda e: e[f'val_{select}'])['epoch']
     json.dump({'args': vars(args), 'best_epoch': best_epoch, 'log': log}, open(f'{args.out}/result.json', 'w'), indent=1)
     print(json.dumps({'run': args.out, 'best_epoch': best_epoch}))
 
