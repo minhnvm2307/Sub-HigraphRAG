@@ -17,6 +17,8 @@
 | [`09_NEW_DIRECTION_ANCHOR_EQUIVARIANCE.md`](09_NEW_DIRECTION_ANCHOR_EQUIVARIANCE.md) | Hướng chính AER: chẩn đoán, lý thuyết, phương pháp |
 | [`10_PAPER_CLAIMS_EVIDENCE.md`](10_PAPER_CLAIMS_EVIDENCE.md) | Bản đồ claim → bằng chứng (C1–C14) |
 | [`13_RBF_LAP_LUAN_VA_HUONG_TIEP.md`](13_RBF_LAP_LUAN_VA_HUONG_TIEP.md) | RBF-Ret: lập luận, lợi / hại, phân rã lỗi QA, mức trần nhãn |
+| [`15_RBF_KIEN_TRUC_VA_CONG_THUC.md`](15_RBF_KIEN_TRUC_VA_CONG_THUC.md) | **Kiến trúc RBF-Ret cho bản thảo:** sơ đồ, công thức từng module, pseudo-code, mệnh đề hình thức, so sánh NBFNet / A*Net / TransferNet / REL-RAG, nhân tử dừng φ |
+| [`figs/rbf_architecture.tex`](figs/rbf_architecture.tex) | Hình kiến trúc (TikZ) cho paper |
 | [`14_TONG_KET_GIOI_HAN.md`](14_TONG_KET_GIOI_HAN.md) | **Tổng kết giai đoạn RBF (10-23): khó khăn, giới hạn, bài học cho hướng mới** |
 | [`REPORT.md`](REPORT.md) | Benchmark retrieval đầy đủ (ans, SP, GPT, GPTp; nhiều budget); §3 là kết quả cổng của AER |
 | [`papers/`](papers/) | Paper REL-RAG |
