@@ -21,7 +21,7 @@ import argparse, json, os
 import torch
 from tqdm import tqdm
 
-from train_retriever import ROOT, attach_bge_prior, build_scorer, load_split, to_device
+from train_retriever import EXTERNAL, ROOT, attach_bge_prior, build_scorer, load_split, to_device
 
 RUNS = f'{ROOT}/exp_qrdde/runs'
 MODES = ['base', 'aer', 'adr', 'adr_aer']
@@ -74,9 +74,11 @@ class QuestionScorer:
 def main():
     ap = argparse.ArgumentParser(description='Retrieve top-500 triples for every test question (see the docstring).')
     ap.add_argument('--run', required=True, help='run directory name in exp_qrdde/runs (or a path)')
-    ap.add_argument('--dataset', required=True, choices=['webqsp', 'cwq', 'grailqa_paper'], help='test set to retrieve on')
+    ap.add_argument('--dataset', required=True, choices=['webqsp', 'cwq', *EXTERNAL], help='test set to retrieve on')
     ap.add_argument('--modes', default='base', help=f'comma-separated, from {MODES}')
     ap.add_argument('--device', default='cuda:0')
+    ap.add_argument('--top_k', type=int, default=TOP_K, help='triples kept per question')
+    ap.add_argument('--limit', type=int, default=0, help='first N questions only (smoke test)')
     args = ap.parse_args()
     modes = args.modes.split(',')
     assert set(modes) <= set(MODES), f'unknown mode in {modes}'
@@ -94,6 +96,8 @@ def main():
             continue
         attach_bge_prior(records, args.dataset, split, train_args.get('rel_prior', 'none'))
         questions += [(rec, emb) for rec in records]
+    if args.limit:
+        questions = questions[:args.limit]
     out = {mode: {} for mode in modes}
     with torch.no_grad():
         for rec, emb in tqdm(questions, desc=f'{os.path.basename(run_dir)} on {args.dataset}'):
@@ -101,13 +105,13 @@ def main():
             names, relations = rec['entity_names'], rec['relation_list']
             for mode in modes:
                 scores = scorer.scores(mode)
-                top = torch.topk(scores, min(TOP_K, len(scores))).indices.tolist(); scores = scores.cpu()
+                top = torch.topk(scores, min(args.top_k, len(scores))).indices.tolist(); scores = scores.cpu()
                 out[mode][rec['id']] = {
                     'question': rec['question'], 'q_entity': [names[i] for i in rec['q_ent']],
                     'a_entity_in_graph': [names[i] for i in rec.get('a_ent', [])],
                     'scored_triples': [(names[rec['h'][i]], relations[rec['r'][i]], names[rec['t'][i]], float(scores[i])) for i in top]}
     for mode in modes:
-        path = f'{run_dir}/pred_{args.dataset}_{mode}.pth'
+        path = f'{run_dir}/pred_{args.dataset}_{mode}' + ('_smoke' if args.limit else '') + '.pth'
         torch.save(out[mode], path); print(f'{len(out[mode])} questions -> {path}')
 
 

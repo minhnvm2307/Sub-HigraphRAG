@@ -1523,3 +1523,123 @@ Model: RBF + BGE + WL nhãn v2. Train và infer trên GPU local 1080 Ti. Script 
 - **Kết luận:**
   - φ là cải tiến retrieval thật cho xếp hạng chain, ansR khi transfer và nhóm tổ hợp mới. Nhưng **đưa thẳng thứ tự chain vào prompt P2 thì có hại**, vì số ứng viên tăng, khớp với EXP-43 (CWQ: ít ứng viên thì tốt hơn).
   - Muốn dùng φ cho QA thì phải giữ số ứng viên không tăng, ví dụ chỉ đổi thứ tự các path P2 vốn có. Hoặc dùng bản no_lex + φ với context top-k triple chuẩn.
+
+## EXP-46 — Đánh giá đề xuất docs/16 (Gemini), loss phân biệt chain, mã hoá khoảng cách theo bước (10-26)
+Train và infer trên GPU local 1080 Ti. Mọi run: WebQSP, rbfonly, nhãn v2, effective_num, BGE prior, seed 42, patience 10 (giống `abl_pi_full_webqsp`, dùng làm mốc BCE). Code mới: `chain_candidates.py`, `--triple_loss / --chain_loss / --chain_weight / --hop_cond` (`train_retriever.py`), `propagate_hop` (`rbf.py`), `analysis/chain_top1.py`, `analysis/chain_errors_after_phi.py`, `analysis/dataset_shift/`, `build_grailqa995.py`.
+
+- **Kiểm các đề xuất của docs/16** (nhánh `exp/rbf-paper-formalism`; chưa merge, script chạy từ scratchpad):
+  - Bản tham chiếu DP (C-A, C-A2, C-B, C-C) đúng: sai số 1.8e-15 / 5.5e-11; greedy đạt bằng tối ưu.
+  - E1 (giải phẫu top-100): fan-out (h, r) lớn nhất trung bình 21 triple; 76% điểm hoà nhau; khoảng 40 ứng viên có tên.
+  - **E2 (chọn tập submodular / cap): bác.** Số ứng viên có tên *tăng* 40.5 → 49–56; PathHit@50 trên transfer rơi 66.5 → 35–53, vì cắt fan-out làm đứt chain qua CVT.
+  - **E3 (quét T ∈ [2, 5], L ∈ [1, 3] lúc test): bác.** ansR@50 trên transfer chỉ dao động 91.0–91.6.
+- **Ablation loss / factor.** "Chain hạng 1" đo trên cùng tập chain ứng viên (do model mốc khai thác) cho mọi run; nhóm "tổ hợp mới" gồm 597 câu CWQ.
+
+  | Run | ansR@50 WebQSP / transfer | PathHit@50 transfer | Chain hạng 1 transfer / WebQSP | Tổ hợp mới |
+  |---|---|---|---|---|
+  | BCE (mốc) | 93.0 / 90.3 | 62.5 | 44.0 / 76.8 | 87.7 |
+  | BCE + φ (đóng băng π) | 94.1 / 91.4 | 66.5 | 63.1 / 85.8 | **89.9** |
+  | Listwise (ParallaxRAG) | 88.3 / 78.8 | 41.9 | 40.9 / – | 71.3 |
+  | BCE + chain-CE | 90.4 / 87.6 | 59.6 | **68.2** / **90.8** | 85.8 |
+  | BCE + chain-CE + φ (train chung) | 92.0 / 89.1 | 64.0 | **68.6** / **90.8** | 86.5 |
+  | BCE + chain-margin | 90.8 / 88.6 | **66.7** | 61.1 / 90.1 | 87.6 |
+  | BCE + chain-CE, trọng số 0.3 | 92.4 / 89.7 | 63.6 | 63.6 / 89.5 | 88.2 |
+  | hop (π biết bước đầu / bước sau) | **94.5** / 87.8 | 58.6 | 46.5 / 80.4 | 82.7 |
+  | hop + chain-CE | 91.8 / 85.2 | 53.9 | 62.6 / 90.0 | – |
+
+  - Loss chain: âm là chain mà điểm cuối không thuộc tập đáp án gold (tránh false negative). Loss này đưa chain hạng 1 trên transfer từ 44% lên 64–69%, bằng hoặc hơn φ, đổi lại ansR giảm 0.6–2.7.
+  - **hop: kiểm chứng trực tiếp Mệnh đề 1.** Nhóm "chain đã thấy" tăng 93.6 → **96.2**, nhưng "tổ hợp mới" giảm 87.7 → 82.7 và "relation chưa thấy" giảm 87.4 → 78.9. Một bit vị trí đủ để π học thuộc vị trí của relation; WebQSP có 64% chain 1 bước nên factor "bước sau" thiếu dữ liệu.
+  - Listwise: cùng kiểu thất bại với H7 (softmax trên toàn bộ triple của graph).
+- **Lỗi chain còn lại sau φ** (`chain_errors_after_phi.py`), transfer:
+  - chain hạng 1 đúng 68.1%;
+  - sai relation, cùng anchor 11.6%; cùng relation đầu, khác bước 2 8.9%; anchor khác 5.6%; dừng sớm 4.8%.
+  - Tín hiệu cấu trúc ở entity cuối, so chain gold với chain hạng 1 trên 804 câu sai (đúng chiều / sai chiều): "gần topic khác" 58 / 0; bậc 414 / 366; số điểm cuối 133 / 480.
+  - → Mã hoá khoảng cách ở entity cuối có trần khoảng 2%. Lỗi chủ yếu là chọn sai relation, không phải lỗi cấu trúc.
+- **WebQSP so với CWQ** (`analysis/dataset_shift`):
+  - JS divergence của relation trên chain gold: WebQSP train / CWQ test 0.32 bit, so với WebQSP train / WebQSP test 0.08.
+  - Câu CWQ có chain gold đã xuất hiện trong WebQSP train: 50%. Câu 1 bước: 26%, so với 64% ở WebQSP.
+  - 2,328/3,531 câu test CWQ dựng từ câu *train* của WebQSP. RBF transfer không hưởng lợi từ điều này: ansR@50 91.4 so với 91.6 trên nhóm dựng từ WebQSP test. Model train CWQ thì có: 96.0 so với 93.2, vì CWQ train cũng dựng từ WebQSP train.
+- **RAPL tác giả trên CWQ**, cùng số triple mỗi câu với RBF (`rapl_faithful/p4_eval.py`):
+  - CWQ ID: ansR 74.2 so với RBF + φ 92.1.
+  - WebQSP→CWQ: 69.1 so với 86.0 (no_lex + φ).
+  - Trung bình khoảng 75 triple khác nhau mỗi câu, trong khi paper nói khoảng 50.
+- **GrailQA:**
+  - Tập 728 câu cũ chỉ có 233 bộ topic khác nhau.
+  - Tập 995 câu (`data_ext/grailqa_995`, mọi câu GrailQA train có topic nằm trong subgraph ODA) có phân bố số đáp án 62.2 / 19.6 / 6.2 / 12.0, rất gần paper (62.0 / 18.2 / 6.8 / 13.0). Nhưng không quy tắc lọc nào ra đúng 874 câu.
+  - Người dùng quyết định **không chạy QA** trên tập này.
+- **ParallaxRAG** (arXiv 2510.15552, có code; việc paper vào ACL chưa xác nhận được):
+  - Llama-8B: CWQ 58.4 Hit; WebQSP→CWQ 54.8 Hit. Cả hai thấp hơn RBF.
+  - BioASQ: không công bố KG/subgraph; đưa snippet gold vào LLM; báo theo loại câu, không theo hop → không chạy.
+- **FBV-KGQA** (EMNLP'26): xác minh bằng LLM, không áp dụng được cho retriever không gọi LLM.
+- **Bổ sung 10-26 (chiều/tối): so φ công bằng, seed, ô CWQ.** Train trên 2 server Kaggle T4 (`vast/setup_kaggle_t4.sh`) và local. Bảng đầy đủ: `analysis/ablation_table.py`.
+  - **Bảng gộp ở trên bị lệch mốc:** dòng "BCE + φ (đóng băng π)" đặt φ lên π của checkpoint *cũ*, train bằng code 10-16. So lại trên cùng π (code mới), train trên WebQSP, đo trên WebQSP / transfer:
+
+    | Run | ansR@50 WebQSP / transfer | PathHit@50 transfer | Chain hạng 1 transfer / WebQSP | Tổ hợp mới |
+    |---|---|---|---|---|
+    | BCE, seed 42 / 0 | 93.0 / 93.4 · 90.3 / 89.1 | 62.5 / 61.6 | 44.0–45.5 / 76.8–80.9 | 87.3–87.7 |
+    | BCE, rồi φ post-tuning | 93.6 · 91.7 | 65.1 | 61.3 / 82.7 | 90.1 |
+    | **BCE + φ train chung từ đầu**, seed 42 / 0 / 1 / 2 | 94.6 / 93.6 / 94.2 / 94.1 · 91.4 / 92.2 / 92.3 / 92.3 | 67.9 / 67.7 / 69.2 / 65.5 | 65.2–69.4 / 85.8–87.9 | 89.4–91.2 |
+    | BCE + chain-CE 0.3 + φ từ đầu | 92.5 · 90.3 | 67.3 | 71.8 / 88.7 | 87.9 |
+
+    → Train φ chung từ đầu tốt hơn post-tuning, và **ổn định qua 4 seed khi transfer**: ansR +1.1 đến +3.2, PathHit +3 đến +7.6 so với mốc.
+  - **Train trên CWQ, đo trên CWQ ID / transfer sang WebQSP:**
+
+    | Run | ansR@50 / PathHit@50 CWQ | ansR@50 / PathHit@50 WebQSP | Chain hạng 1 CWQ |
+    |---|---|---|---|
+    | BCE (code mới) | 94.5 / 85.6 | 92.0 / 88.5 | 66.6 |
+    | BCE, rồi φ post-tuning | 94.6 / 85.0 | 91.9 / 89.7 | 81.8 |
+    | BCE + φ train chung | 94.2 / 84.0 | 92.1 / 90.2 | 81.1 |
+    | BCE + chain-CE 0.3 | 91.7 / 76.3 | 89.7 / 84.1 | 70.3 |
+    | BCE + chain-CE (trọng số 1) + φ | 91.7 / 70.8 | 88.3 / 79.4 | 83.6 |
+
+    → Trên CWQ ID, φ trung tính về ansR / PathHit; nó chỉ nâng thứ hạng chain (+15) và transfer sang WebQSP (PathHit +1.2 đến +1.7). Loss chain hại CWQ ID.
+  - **Code cũ và code mới cho cùng cấu hình:** `rbf_aux` của run cũ không có tác dụng với `rbfonly`. Hai run có đường train trùng nhau (best epoch 17; val `triple_recall@100` 0.9222 so với 0.9223). Trên test, ansR@50 95.05 so với 94.47, chênh −0.58 [CI −1.27, +0.11]. Đây là nhiễu giữa hai lần train (môi trường khác nhau, cộng với trung bình 21 triple hoà điểm với triple hạng 50), không phải lỗi code.
+  - **QA dự kiến** của cấu hình tốt nhất (BCE + φ) so với bản cũ (BGE + WL, không φ), ước lượng từ việc đáp án có lọt vào top-100 hay không, với P(trả lời đúng) đo trên run QA cũ: WebQSP +0.3, WebQSP→CWQ +0.05, CWQ −0.2 Hit-ans. Tất cả trong sàn nhiễu, vì phần tăng của φ nằm ở @50 và ở thứ hạng chain, còn context top-100 gần như không đổi. Chưa chạy QA thật.
+
+## EXP-47 — Retrieval zero-shot trên tập multi-hop ngoài: GTSQA, GrailQA, MetaQA-3hop (10-27)
+Mục tiêu: so retrieval ngoài WebQSP/CWQ, chia theo số hop và theo domain. Không train lại, không tải dữ liệu mới: dùng `data_ext/{gtsqa,grailqa_paper,metaqa3}` (test, embedding GTE và điểm BGE đã có từ EXP-24).
+- **Code:** `EXTERNAL` trong `train_retriever.py` thêm `gtsqa`, `metaqa3` (`n_text = n_ent`: Wikidata / WikiMovies không có CVT); `infer.py --top_k --limit`; `analysis/external/eval_external.py` (metric, nhóm) và `plot_external.py` (`fig_multihop.png`, `fig_domain.png`). Queue `logs/ext_queue_1027.sh`, top-200 triple, mode base. SubgraphRAG DDE trên GrailQA chạy CPU (OOM GPU, graph ~22k triple/câu khi có process khác giữ 5 GB).
+- **Retriever:** SubgraphRAG DDE (`{ds}_dde`), RBF old best (`{ds}_rbfnb_bge_wl_sparql2_s42`), RBF + φ best (`abl_bce_stop_scratch_{ds}`), φ post-tuned (`stop_frozen_cwq`); mỗi cái train trên WebQSP và trên CWQ.
+- **Mọi câu test đều được tính.** GTSQA: subgraph chính thức của paper (≤ 30k cạnh, PPR + cạnh gold + cạnh gây nhiễu cùng metapath), mọi triple gold đều nằm trong graph.
+
+| Tập (câu) | Retriever | train WebQSP: ansR@50 / @200 · GT-R@200 | train CWQ: ansR@50 / @200 · GT-R@200 |
+|---|---|---|---|
+| GTSQA (1,622) | SubgraphRAG DDE | 35.4 / 48.0 · 44.1 | 26.1 / 39.8 · 30.4 |
+| | RBF old best | 52.1 / 65.0 · 58.1 | 54.5 / 66.7 · 56.8 |
+| | **RBF + φ** | **67.7 / 78.6 · 71.5** | **67.5 / 79.5 · 71.1** |
+| | φ post-tuned | – | 58.2 / 72.0 · 61.4 |
+| GrailQA (728) | SubgraphRAG DDE | 40.3 / 54.4 | 41.4 / 58.0 |
+| | RBF old best | 63.3 / 76.0 | 48.9 / 61.5 |
+| | **RBF + φ** | **67.6 / 79.7** | **55.8 / 67.9** |
+| MetaQA-3hop (14,118) | SubgraphRAG DDE | 21.5 / 51.8 | 33.1 / 61.4 |
+| | RBF old best | 46.4 / 70.0 | 44.7 / 70.0 |
+| | **RBF + φ** | **49.9 / 70.2** | **49.1 / 70.2** |
+
+- **So với paper GTSQA** (Cattaneo et al., TMLR 2026, Table 2; các model **train trên GTSQA train 30k câu**, cùng subgraph): SubgraphRAG (200 triple) ansR 84.4 · GT-R 79.1; RoG (~72 triple) 71.8 · 54.7; SR (~73) 49.4 · 30.2; GCR (~6.5) 45.5 · 40.7. RBF + φ **zero-shot** ở 200 triple: 78.6–79.5 · 71.1–71.5, tức kém SubgraphRAG in-domain 5–8 điểm, hơn RoG / SR in-domain. SubgraphRAG zero-shot của mình chỉ 40–48 · 30–44.
+- **Theo hop** (ansR@50, train WebQSP): GTSQA RBF + φ phẳng theo hop (63 → 70 → 68 → 70) trong khi DDE giảm (44 → 20); GrailQA 75 / 63 / 58 vs DDE 61 / 29 / 9.
+- **GTSQA theo số seed** (ansR@200 · GT-R@200): 3+ seed (281 câu) RBF + φ 53.9 · 36.9 (WebQSP) / 75.6 · 52.1 (CWQ), old best 32.3 · 17.6 / 54.3 · 33.4, DDE 27.4 · 13.8 / 20.3 · 10.1. φ giúp nhiều nhất ở câu giao nhiều seed. Theo test_type: unseen_graph_type 73.9–75.3 · 63.5–64.1 (DDE 32.8–37.8).
+- **GrailQA theo domain** (`fig_domain.png`): RBF + φ (WebQSP) ≥ old best ở 8/9 domain lớn (thua ở biology 43 vs 50; religion hoà 72); train CWQ yếu hơn WebQSP trên GrailQA (digicams 12, 3 hop 23), khác GTSQA.
+- **MetaQA:** trung bình 7.9 đáp án/câu nên ansR bị giới hạn bởi ngân sách; ansHit@200 93.2 (RBF + φ) vs 76.9–89.1 (DDE). Các paper MetaQA chỉ báo Hits@1 QA, không có số retrieval để so.
+- **Hạn chế:** zero-shot, một seed; GrailQA là bộ 728 câu tự dựng (không phải 874 câu của REL-RAG); chưa chạy RAPL trên các tập này (line graph quá lớn với GTSQA / GrailQA). So công bằng với bảng GTSQA cần train in-domain (tải GTSQA train, ~30k câu, cần embed; chưa làm).
+
+## EXP-48 — Table 6 của GTSQA trên Freebase: triple gold vs triple shortest-path (10-27)
+Mục tiêu: lặp lại Table 6 của Cattaneo et al. (2511.04473), vốn đo trên Wikidata, cho WebQSP / CWQ. CPU, không cần dữ liệu mới.
+- **Code:** script của user, `analysis/sp_vs_gold_overlap.py`, thêm `--dataset/--split` (đọc `data/<ds>/<split>.pkl`, gold chain lấy từ `labels.gold_queries_for`). `latent_chain_pilot.records_from_list` giờ đọc được format repo. Output `analysis/overlap/ov_<ds>_<split>.tsv` và `_per_question.jsonl`.
+- **Định nghĩa:**
+  - **GT** = các trail đi theo chain gold (predicate, chiều) từ topic tới đáp án, cắt ngược để chỉ giữ cạnh dẫn tới đáp án. Không gồm triple ràng buộc.
+  - **SP** = mọi triple nằm trên một shortest path vô hướng giữa topic và đáp án.
+  - **Hop** = số predicate trong chain; CVT tính là một hop.
+
+| Tập | hop | n | %GT trong SP | %SP trong GT | #GT | #SP |
+|---|---|---|---|---|---|---|
+| Wikidata (paper, train) | 1 / 2 / 3 / 4 | – | 100 / 89.8 / 54.7 / 27.5 | 91.0 / 52.7 / 29.6 / 13.3 | 2.37 / 3.08 / 3.6 / 4 | 2.67 / 19.6 / 46.3 / 100.4 |
+| WebQSP train | 1 / 2 | 1,623 / 983 | 100 / 86.2 | 57.7 / 26.4 | 4.88 / 11.55 | 12.3 / 61.7 |
+| WebQSP test | 1 / 2 | 954 / 541 | 100 / 89.1 | 59.4 / 26.4 | 5.32 / 9.26 | 12.9 / 50.4 |
+| CWQ train | 1 / 2 / 3 / 4+ | 5,024 / 12,866 / 1,150 / 450 | 100 / 92.2 / 39.4 / 55.3 | 38.7 / 28.2 / 20.1 / 19.2 | 1.36 / 3.55 / 6.47 / 6.43 | 4.6 / 23.4 / 12.3 / 23.8 |
+| CWQ test | 1 / 2 / 3 / 4+ | 669 / 1,621 / 136 / 70 | 100 / 94.5 / 46.7 / 50.9 | 34.2 / 28.1 / 23.6 / 15.9 | 1.46 / 3.07 / 7.19 / 6.21 | 5.8 / 20.1 / 11.3 / 27.7 |
+
+- **Bỏ qua** (chain không khớp graph hoặc không có SP): WebQSP train 68, WebQSP test 120, CWQ train 1,508, CWQ test 815.
+- **Đọc bảng:**
+  - **%GT trong SP** theo đúng xu hướng của paper: 1–2 hop thì SP gần như phủ hết gold (86–100). Từ 3 hop trở lên SP bỏ sót 45–60% triple gold, tức nhãn SP thiếu đúng phần chain dài.
+  - **%SP trong GT** của Freebase thấp hơn Wikidata ngay từ 1 hop (34–59 so với 91): nhãn SP trên Freebase lẫn nhiều cạnh ngoài gold, do có cạnh song song và đường tắt qua CVT / type.
+  - Ở CWQ 3 hop, #SP (12.3) nhỏ hơn 2 hop (23.4). Nghĩa là SP đi đường tắt ngắn hơn chain gold, nên không chứa trail gold.
+- **Hệ quả:** cùng kết luận Table 4 của paper (train bằng gold tốt hơn train bằng SP), nên đây không phải đóng góp mới của mình. Bảng này chỉ là bằng chứng rằng hiện tượng đó cũng có trên Freebase. 2×2 (nhãn × kiến trúc): mới có 3 ô, còn thiếu DDE + nhãn v2.

@@ -19,7 +19,11 @@ Scoring, per anchor (topic entity) a, in log space:
      continuation "CVT -> answer".
   4. several anchors: union(e) = max_a path_a(e); inter(e) = the same path when its far end is also reached from the
      other anchors (product t-norm); final(e) = logaddexp(union, inter). With one anchor final = union + log 2.
-The final score is used as a logit (log_to_logit) and trained with BCE on the triple labels.
+  5. stop factor phi(stop | q, r) (--stop): the complete walk of mm pays log phi of its last step, so it prefers chains
+     that END on the question's answer relation (prefixes stopping at a bridge entity and chains ending on type
+     relations such as common.topic.notable_types otherwise tie with or beat the full chain).
+The final score is used as a logit (log_to_logit) and trained with BCE on the triple labels (+ BCE of phi on the last
+steps of the gold walks). Best configuration (docs/04 EXP-46): pi and phi trained jointly from scratch.
 """
 import torch
 import torch.nn as nn
@@ -31,25 +35,22 @@ COMPLETION_STEPS = 2             # mm: longest continuation after a triple
 
 
 class RBF(nn.Module):
-    def __init__(self, emb=1024, hidden=256, T=3, mm=False, extra_prior=0, pi_input='full', stop=False):
+    def __init__(self, emb=1024, hidden=256, T=3, mm=False, extra_prior=0, stop=False):
         """emb: text-embedding size; T: propagation steps; mm: complete-path scoring (set True at test time);
         extra_prior: number of extra per-relation prior columns read from x['rel_prior'] (BGE: 2);
-        pi_input: ablation of the inputs of pi ('full', 'no_lex': drop lexical(q, r), 'no_prod': drop z_q * z_r,
-        'no_lex_prod': drop both); stop: add the stop factor phi (see below)"""
+        stop: add the stop factor phi (see below; the best configuration trains it jointly with pi, --stop)"""
         super().__init__()
         self.T, self.mm, self.extra_prior = T, mm, extra_prior
-        self.use_lex, self.use_prod = 'lex' not in pi_input, 'prod' not in pi_input
-        n_in = (3 if self.use_prod else 2) * emb + 1 + int(self.use_lex) + extra_prior
+        n_in = 3 * emb + 2 + extra_prior
         self.pi = nn.Sequential(nn.Linear(n_in, hidden), nn.ReLU(), nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, 2))
         # stop factor phi(stop | q, r): probability that a walk whose LAST step is relation r (forward / reverse) ends
         # there, i.e. that r is the question's answer relation. Same inputs as pi, so it still depends on (q, r) only.
-        # Used by mm at test time: a complete walk pays log phi of its last step instead of stopping for free.
+        # Used by mm: a complete walk pays log phi of its last step instead of stopping for free.
         self.stop = nn.Sequential(nn.Linear(n_in, hidden), nn.ReLU(), nn.Linear(hidden, 2)) if stop else None
 
     def relation_inputs(self, x):
         q = x['q'].expand(len(x['rel']), -1)
-        parts = [q, x['rel']] + ([q * x['rel']] if self.use_prod else [])
-        parts += ([x['lex'][:, None]] if self.use_lex else []) + [F.cosine_similarity(x['rel'], q, dim=-1)[:, None]]
+        parts = [q, x['rel'], q * x['rel'], x['lex'][:, None], F.cosine_similarity(x['rel'], q, dim=-1)[:, None]]
         if self.extra_prior:
             parts.append(x['rel_prior'])
         return torch.cat(parts, 1)
